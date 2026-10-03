@@ -21,6 +21,10 @@ pub mod listing;
 pub mod message;
 pub mod payment;
 
+/// The `self_encryption` version envelopes are built with, re-exported so
+/// callers build data maps with the same one.
+pub use self_encryption;
+
 pub use envelope::{
     is_envelope, Envelope, EnvelopeError, Metadata, ENVELOPE_VERSION, MAGIC, MAX_CONTENT_TYPE_LEN,
     MAX_NAME_LEN,
