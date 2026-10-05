@@ -1,9 +1,9 @@
 [package]
 name = "ant-listings"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
-description = "Listed files for storage networks built on Autonomi's protocol: the envelope format, listing records, payment checks and the listings protocol"
+description = "Envelopes and listings for storage networks built on Autonomi's protocol: the envelope format, listing records, payment checks, upload proofs and the listings protocol"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Project-DSpace/ant-listings"
 publish = false
@@ -19,4 +19,5 @@ thiserror = "2"
 [dev-dependencies]
 saorsa-core = { version = "0.28.0", default-features = false }
 saorsa-pqc = { version = "0.5.2", default-features = false }
+serde_json = "1"
 sha3 = "0.10"

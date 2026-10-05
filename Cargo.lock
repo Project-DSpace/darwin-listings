@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "ant-listings"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ant-protocol",
  "postcard",
@@ -404,6 +404,7 @@ dependencies = [
  "saorsa-pqc",
  "self_encryption",
  "serde",
+ "serde_json",
  "sha3 0.10.9",
  "thiserror 2.0.21",
 ]
