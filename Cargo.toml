@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.91"
 description = "Envelopes and listings for storage networks built on Autonomi's protocol: the envelope format, listing records, payment checks, upload proofs and the listings protocol"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Project-DSpace/ant-listings"
+repository = "https://github.com/Project-DSpace/darwin-listings"
 publish = false
 
 [dependencies]
