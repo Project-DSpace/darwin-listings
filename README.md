@@ -368,9 +368,10 @@ uses with a node should be the complement of another it uses with the node,
 which ids chosen at random almost never are. A watch lasts until the
 requester's next `ChangesRequest` to the node, which sets a new one if it asks
 for one, or for three minutes if none comes: the minute until its next poll,
-and two more. A node keeps at most four watches at once, so a watch asked for
-may not be set; the requester can't tell. Pushes are never acknowledged: the
-next request catches up on a missed one.
+and two more. A node keeps at most four watches at once. Once it has four, it
+refuses a new one, so a requester that already watches is never pushed out;
+the request is still answered, and the requester can't tell. Pushes are never
+acknowledged: the next request catches up on a missed one.
 
 `FeedSync`, a state machine that does no I/O, keeps a reader's mirror of one
 node's range. Each round it asks for the changes after the last record it has,

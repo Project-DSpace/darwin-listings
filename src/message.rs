@@ -48,8 +48,9 @@ pub const MAX_LIST_LIMIT: u32 = 256;
 /// many as a Kademlia bucket holds.
 pub const VIEW_PEERS: usize = 20;
 
-/// The most watches ([`ChangesRequest::watch`]) a node keeps at once, so a
-/// watch asked for may not be set. The requester can't tell, and its next
+/// The most watches ([`ChangesRequest::watch`]) a node keeps at once. Once
+/// it has this many it refuses a new one, so a requester that already
+/// watches is never pushed out. The requester can't tell, and its next
 /// request still finds every change.
 pub const MAX_WATCHERS: usize = 4;
 
