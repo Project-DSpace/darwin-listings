@@ -26,11 +26,14 @@
 //! nearest the address. The caller counts those across its mirrors, in sync
 //! or not, and passes the count in ([`FeedSync::set_backed`]). In a round, a
 //! node is asked for at most its allowance's worth of full pages, however few
-//! records each holds, and its mirror never grows past its allowance: each
-//! request after the round's first needs room in it for a full page of new
-//! addresses. If the round's first request finds no room, the mirror starts
-//! again from nothing: it is emptied when the answer comes, and the range is
-//! read afresh. Only the node's answers can shrink its mirror, so they are
+//! records each holds, each push counting as a page too. Until the node has
+//! answered in the round, pushes leave a page for its answer, and the round's
+//! first request is sent whatever they have used, so each round asks the node
+//! at least once. Its mirror never grows past its allowance: each request
+//! after the round's first needs room in it for a full page of new addresses.
+//! If the round's first request finds no room, the mirror starts again from
+//! nothing: it is emptied when the answer comes, and the range is read
+//! afresh. Only the node's answers can shrink its mirror, so they are
 //! never held back for want of room: a mirror holding entries the node no
 //! longer serves is put right as the node answers, even when nobody serves
 //! them any more and they earn it nothing. A node holding real listings
@@ -90,8 +93,8 @@ pub enum Pushed {
     /// is ahead of the mirror until a request catches up.
     Behind,
     /// Left alone: malformed, from another epoch, no further on than the
-    /// mirror, sent while the range is read afresh, or beyond the node's
-    /// allowance.
+    /// mirror, sent while the range is read afresh, or beyond what the
+    /// node's allowance leaves for pushes.
     Ignored,
 }
 
@@ -249,10 +252,11 @@ impl FeedSync {
     /// that set it, and can arrive before that request's answer: pass them to
     /// [`push`](Self::push).
     ///
-    /// The round's first request is sent even if the mirror has no room left
-    /// for a full page within the node's allowance. It then starts the
-    /// mirror again from nothing: the mirror is emptied when the answer
-    /// comes, and the range is read afresh.
+    /// The round's first request is sent even if the round's pushes have
+    /// used the node's allowance, or the mirror has no room left for a full
+    /// page within it. Without room, it starts the mirror again from
+    /// nothing: the mirror is emptied when the answer comes, and the range
+    /// is read afresh.
     pub fn next_request(&mut self, want_peers: bool, watch: bool) -> Option<ListingsBody> {
         if self.ended.is_some() || self.asked.is_some() || self.in_sync() {
             return None;
@@ -338,10 +342,11 @@ impl FeedSync {
     /// whose request id is [`push_request_id`](crate::push_request_id) of
     /// the id of a request that set a watch, whether it comes before or after
     /// that request's answer. Taken if it brings the mirror exactly to the
-    /// push's head, within the node's allowance: the push is then the node's
-    /// report this round, and the mirror is in sync once the node has also
-    /// answered a request this round. If it doesn't bring the mirror there,
-    /// the node is ahead of the mirror, and
+    /// push's head, within the node's allowance, of which a page is kept for
+    /// the node's answer until it has answered this round: the push is then
+    /// the node's report this round, and the mirror is in sync once the node
+    /// has also answered a request this round. If it doesn't bring the mirror
+    /// there, the node is ahead of the mirror, and
     /// [`next_request`](Self::next_request) asks it to catch up. Check that
     /// the push came from the node before passing it in.
     pub fn push(&mut self, push: &ChangesResponse) -> Pushed {
@@ -350,7 +355,7 @@ impl FeedSync {
             || push.epoch != self.epoch
             || push.head <= self.head
             || check_push(self.range, push).is_err()
-            || PAGE.saturating_mul(self.pages + 1) > allowance
+            || PAGE.saturating_mul(self.pages + 1 + usize::from(!self.answered)) > allowance
         {
             return Pushed::Ignored;
         }
@@ -683,13 +688,13 @@ impl FeedSync {
         WALK_FREE_LISTINGS.saturating_add(WALK_PER_BACKED.saturating_mul(self.backed))
     }
 
-    /// Whether the node may be asked another page this round: it has earned
-    /// one, and its mirror has room for a full page of new addresses, unless
-    /// the node hasn't answered this round yet (see
-    /// [`next_request`](Self::next_request)).
+    /// Whether the node may be asked another page this round: always until
+    /// it has answered this round (see [`next_request`](Self::next_request)),
+    /// and after that while it has earned another page and its mirror has
+    /// room for a full page of new addresses.
     fn may_ask(&self) -> bool {
-        PAGE.saturating_mul(self.pages + 1) <= self.allowance()
-            && (!self.answered || self.has_room())
+        !self.answered
+            || (PAGE.saturating_mul(self.pages + 1) <= self.allowance() && self.has_room())
     }
 
     /// Whether the mirror has room within the allowance for a full page of
@@ -1992,6 +1997,56 @@ mod tests {
         assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
         assert_eq!(reader.syncs[0].pages(), 2);
         assert!(reader.mirrors(&net, 0));
+    }
+
+    #[test]
+    fn pushes_before_the_rounds_poll_leave_a_page_for_it() {
+        // A burst of new records, each pushed before the round's poll is
+        // sent, as when the poll waits behind other nodes' polls. Then,
+        // the second time, the node's backing falls before its poll is
+        // sent, as when other mirrors drop entries it holds.
+        for falls in [false, true] {
+            let (mut net, mut reader, _) = synced();
+            let range = reader.syncs[0].range();
+            let prefix = net.ids[0][..8].to_vec();
+            let allowance = WALK_FREE_LISTINGS + WALK_PER_BACKED * reader.counts[0];
+            reader.syncs[0].begin_round();
+            let mut taken = 0;
+            for n in 0..1_000 {
+                let head = reader.syncs[0].head();
+                net.nodes[0].serve(fake(made_up(&prefix, n + 10)));
+                match reader.syncs[0].push(&net.nodes[0].push(range, head)) {
+                    Pushed::Applied(touched) => {
+                        taken += 1;
+                        reader.recount(0, &touched);
+                    }
+                    Pushed::Ignored => break,
+                    Pushed::Behind => panic!("each push carries its record"),
+                }
+            }
+            if falls {
+                reader.syncs[0].set_backed(0);
+            }
+            // The poll goes out all the same, with its watch, and its
+            // answer brings the mirror in sync.
+            let Some(ListingsBody::ChangesRequest(request)) =
+                reader.syncs[0].next_request(false, true)
+            else {
+                panic!("a changes request, falls: {falls}");
+            };
+            assert!(request.watch);
+            let answer = net.nodes[0]
+                .answer(&ListingsBody::ChangesRequest(request))
+                .unwrap();
+            let touched = reader.syncs[0].answer(answer);
+            reader.recount(0, &touched);
+            assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
+            assert!(reader.mirrors(&net, 0));
+            // The pushes stopped a page short of the node's allowance, and
+            // the poll's answer took that page.
+            assert_eq!(taken, allowance / PAGE - 1);
+            assert_eq!(reader.syncs[0].pages(), allowance / PAGE);
+        }
     }
 
     #[test]
