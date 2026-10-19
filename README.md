@@ -251,7 +251,8 @@ Messages travel on the topic `listings.v2`, encoded with postcard:
 | `RangeListRequest { prefix, bits, after, limit }` | the digest entries the node serves in the range, in address order, after `after` |
 | `RangeListResponse { entries, more }` | at most 256 entries; `more` if the node serves later ones in the range |
 
-A response with more than 256 listings doesn't decode. A client checks each
+A decoder reads one whole message and ignores any bytes after it. A response
+with more than 256 listings doesn't decode. A client checks each
 page against its request: no more listings than asked for, each in the index,
 with keys from `from` onwards and strictly increasing. The next page starts
 just after the last key, and paging stops when the node has no more, a page is

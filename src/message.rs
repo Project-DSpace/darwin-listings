@@ -1788,7 +1788,7 @@ mod tests {
     #[test]
     fn decoding_ignores_trailing_bytes() {
         // Postcard stops at the end of a whole message and leaves what
-        // follows. Readers and nodes rely on that, so it is pinned here.
+        // follows. It is part of the protocol (see the README), so it is pinned here.
         for message in one_of_each() {
             let bytes = message.encode().unwrap();
             for trailing in [vec![0x00], vec![0xff, 0x13, 0x37], bytes.clone()] {
