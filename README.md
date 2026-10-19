@@ -388,10 +388,17 @@ A node can make up entries without end, so each node is read within the same
 allowance as a walk: 2,048 entries' worth of pages a round, and two more for
 each entry in its mirror whose address at least four of the seven nodes
 nearest it serve, counted where the node is among the twenty nearest the
-address. Each answer counts as a full page, and each push as one too, and a
-mirror never holds more entries than its allowance. A node holding real
-listings earns as it goes; one serving entries nobody else serves stops after
-eight pages, and its mirror stays within 2,048 entries.
+address, from what the mirrors hold whether or not they are in sync. Each
+answer counts as a full page, and each push as one too, and a mirror never
+grows past its allowance: each request after a round's first needs room in
+it for a full page of new addresses. If the round's first request finds no
+room, the mirror starts again from nothing: it is emptied when the answer
+comes, and the range is read afresh. Only the node's answers can shrink its
+mirror, so they are never held back for want of room: a mirror holding entries
+the node no longer serves is put right as the node answers, even when nobody
+serves them any more and they earn it nothing. A node holding real listings
+earns as it goes; one serving entries nobody else serves is read for eight
+pages a round, as a walk reads it, and its mirror stays within 2,048 entries.
 
 `leaves` splits the address space for a reader that knows the nodes' ids: from
 the whole space down, a range is split into its halves only while both hold at

@@ -23,14 +23,20 @@
 //! least [`QUORUM_THRESHOLD`](crate::QUORUM_THRESHOLD) of the
 //! [`NEAREST_NODES`](crate::NEAREST_NODES) nodes nearest it serve, counted
 //! where the node is among the [`WALK_EARNING_RANKS`](crate::WALK_EARNING_RANKS)
-//! nearest the address. The caller counts those across its mirrors and
-//! passes the count in ([`FeedSync::set_backed`]). In a round, a node is
-//! asked for at most its allowance's worth of full pages, however few records
-//! each holds, and its mirror never grows past its allowance: each request
-//! needs room in it for a full page of new addresses. A node holding real
-//! listings earns as it goes; one serving entries nobody else serves stops
-//! after eight pages, and its mirror stays within [`WALK_FREE_LISTINGS`]
-//! entries.
+//! nearest the address. The caller counts those across its mirrors, in sync
+//! or not, and passes the count in ([`FeedSync::set_backed`]). In a round, a
+//! node is asked for at most its allowance's worth of full pages, however few
+//! records each holds, and its mirror never grows past its allowance: each
+//! request after the round's first needs room in it for a full page of new
+//! addresses. If the round's first request finds no room, the mirror starts
+//! again from nothing: it is emptied when the answer comes, and the range is
+//! read afresh. Only the node's answers can shrink its mirror, so they are
+//! never held back for want of room: a mirror holding entries the node no
+//! longer serves is put right as the node answers, even when nobody serves
+//! them any more and they earn it nothing. A node holding real listings
+//! earns as it goes; one serving entries nobody else serves is read for
+//! eight pages a round, as a walk reads it, and its mirror stays within
+//! [`WALK_FREE_LISTINGS`] entries.
 //!
 //! Nothing here does I/O. The caller starts each round with
 //! [`FeedSync::begin_round`], sends each request [`FeedSync::next_request`]
@@ -108,6 +114,9 @@ pub struct FeedSync {
     answered: bool,
     retries: usize,
     asked: Option<Asked>,
+    /// Whether the request waiting for its answer starts the mirror again
+    /// from nothing.
+    afresh: bool,
     /// Where the node said its feed stood this round, furthest on.
     reported: Option<Report>,
     ended: Option<FeedOutcome>,
@@ -164,6 +173,7 @@ impl FeedSync {
             answered: false,
             retries: 0,
             asked: None,
+            afresh: false,
             reported: None,
             ended: None,
             problem: None,
@@ -180,7 +190,8 @@ impl FeedSync {
     /// epoch 0 it starts as [`new`](Self::new) does, keeping the entries
     /// until the range is read afresh. Give it its count of backed entries
     /// ([`set_backed`](Self::set_backed)) before its first request: a mirror
-    /// holding more than its allowance is asked nothing.
+    /// without room for a full page within its allowance starts again from
+    /// nothing.
     #[must_use]
     pub fn resume(
         range: AddressRange,
@@ -210,6 +221,7 @@ impl FeedSync {
         self.answered = false;
         self.retries = 0;
         self.asked = None;
+        self.afresh = false;
         self.reported = None;
         self.ended = None;
         self.problem = None;
@@ -219,8 +231,10 @@ impl FeedSync {
     /// served by at least [`QUORUM_THRESHOLD`](crate::QUORUM_THRESHOLD) of
     /// the [`NEAREST_NODES`](crate::NEAREST_NODES) nodes nearest it, and this
     /// node is among the [`WALK_EARNING_RANKS`](crate::WALK_EARNING_RANKS)
-    /// nearest it. Keep it up to date as mirrors change, after each answer
-    /// and push.
+    /// nearest it. Count from what each mirror holds, whether or not it is in
+    /// sync, so that a round in which nodes don't answer leaves their
+    /// backing as it was. Keep it up to date as mirrors change, after each
+    /// answer and push.
     pub fn set_backed(&mut self, backed: usize) {
         self.backed = backed;
     }
@@ -234,14 +248,20 @@ impl FeedSync {
     /// [`push_request_id`](crate::push_request_id) of the id of the request
     /// that set it, and can arrive before that request's answer: pass them to
     /// [`push`](Self::push).
+    ///
+    /// The round's first request is sent even if the mirror has no room left
+    /// for a full page within the node's allowance. It then starts the
+    /// mirror again from nothing: the mirror is emptied when the answer
+    /// comes, and the range is read afresh.
     pub fn next_request(&mut self, want_peers: bool, watch: bool) -> Option<ListingsBody> {
         if self.ended.is_some() || self.asked.is_some() || self.in_sync() {
             return None;
         }
-        if !self.within_allowance() {
+        if !self.may_ask() {
             self.ended = Some(FeedOutcome::Budget);
             return None;
         }
+        let afresh = !self.has_room();
         let (prefix, bits) = (self.range.prefix(), self.range.bits());
         let changes = |epoch, after| ChangesRequest {
             epoch,
@@ -255,10 +275,11 @@ impl FeedSync {
         let asked = match self.phase {
             Phase::Start => Asked::Changes(changes(0, 0)),
             Phase::Following => Asked::Changes(changes(self.epoch, self.head)),
+            // Starting again from nothing, the range is read from its start.
             Phase::Reading { cursor, .. } => Asked::Range(RangeListRequest {
                 prefix,
                 bits,
-                after: cursor,
+                after: cursor.filter(|_| !afresh),
                 limit: MAX_LIST_LIMIT,
             }),
         };
@@ -267,25 +288,29 @@ impl FeedSync {
             Asked::Range(request) => ListingsBody::RangeListRequest(request.clone()),
         };
         self.asked = Some(asked);
+        self.afresh = afresh;
         Some(body)
     }
 
     /// The node's answer to the request waiting for one. Returns the
     /// addresses whose entries in the mirror changed, for the caller to
-    /// count again. An answer the checks refuse, or one that doesn't answer
-    /// the request, ends the round ([`FeedOutcome::BadPage`]); an
-    /// [`Error`](ListingsBody::Error) counts as no answer. An answer when
-    /// nothing is waiting, such as after [`stop`](Self::stop), is ignored.
+    /// count again: if the request started the mirror again from nothing,
+    /// every address it held that the answer doesn't keep. An answer the
+    /// checks refuse, or one that doesn't answer the request, ends the round
+    /// ([`FeedOutcome::BadPage`]); an [`Error`](ListingsBody::Error) counts
+    /// as no answer. An answer when nothing is waiting, such as after
+    /// [`stop`](Self::stop), is ignored.
     pub fn answer(&mut self, body: ListingsBody) -> Vec<XorName> {
         let Some(asked) = self.asked.take() else {
             return Vec::new();
         };
+        let afresh = std::mem::take(&mut self.afresh);
         match (asked, body) {
             (Asked::Changes(request), ListingsBody::ChangesResponse(response)) => {
-                self.take_changes(&request, response)
+                self.take_changes(&request, response, afresh)
             }
             (Asked::Range(request), ListingsBody::RangeListResponse(response)) => {
-                self.take_range(&request, response)
+                self.take_range(&request, response, afresh)
             }
             (_, ListingsBody::Error { .. }) => {
                 self.missed();
@@ -304,6 +329,7 @@ impl FeedSync {
     /// its round ends ([`FeedOutcome::NoAnswer`]).
     pub fn no_answer(&mut self) {
         if self.asked.take().is_some() {
+            self.afresh = false;
             self.missed();
         }
     }
@@ -312,18 +338,25 @@ impl FeedSync {
     /// whose request id is [`push_request_id`](crate::push_request_id) of
     /// the id of a request that set a watch, whether it comes before or after
     /// that request's answer. Taken if it brings the mirror exactly to the
-    /// push's head: the push is then the node's report this round, and the
-    /// mirror is in sync once the node has also answered a request this
-    /// round. If it doesn't bring the mirror there, the node is ahead of the
-    /// mirror, and [`next_request`](Self::next_request) asks it to catch up.
-    /// Check that the push came from the node before passing it in.
+    /// push's head, within the node's allowance: the push is then the node's
+    /// report this round, and the mirror is in sync once the node has also
+    /// answered a request this round. If it doesn't bring the mirror there,
+    /// the node is ahead of the mirror, and
+    /// [`next_request`](Self::next_request) asks it to catch up. Check that
+    /// the push came from the node before passing it in.
     pub fn push(&mut self, push: &ChangesResponse) -> Pushed {
+        let allowance = self.allowance();
         if self.phase != Phase::Following
             || push.epoch != self.epoch
             || push.head <= self.head
             || check_push(self.range, push).is_err()
-            || !self.within_allowance()
+            || PAGE.saturating_mul(self.pages + 1) > allowance
         {
+            return Pushed::Ignored;
+        }
+        let (count, set_hash) = self.with_changes(&push.changes);
+        let fits = (count, set_hash) == (push.count, push.set_hash);
+        if fits && count > u64::try_from(allowance).unwrap_or(u64::MAX) {
             return Pushed::Ignored;
         }
         self.pages += 1;
@@ -334,7 +367,7 @@ impl FeedSync {
             count: push.count,
             set_hash: push.set_hash,
         });
-        if self.with_changes(&push.changes) != (push.count, push.set_hash) {
+        if !fits {
             return Pushed::Behind;
         }
         let touched = self.apply(&push.changes);
@@ -348,8 +381,9 @@ impl FeedSync {
     /// pushes are still taken.
     pub fn stop(&mut self) {
         self.asked = None;
+        self.afresh = false;
         if self.ended.is_none() && !self.in_sync() {
-            self.ended = Some(if self.within_allowance() {
+            self.ended = Some(if self.may_ask() {
                 FeedOutcome::Deadline
             } else {
                 FeedOutcome::Budget
@@ -375,6 +409,7 @@ impl FeedSync {
         let within = self.range.covers(&range);
         self.range = range;
         self.asked = None;
+        self.afresh = false;
         self.reported = None;
         self.phase = match self.phase {
             Phase::Start => Phase::Start,
@@ -434,7 +469,7 @@ impl FeedSync {
     /// this round.
     #[must_use]
     pub fn idle(&self) -> bool {
-        self.asked.is_none() && (self.ended.is_some() || self.in_sync() || !self.within_allowance())
+        self.asked.is_none() && (self.ended.is_some() || self.in_sync() || !self.may_ask())
     }
 
     /// The pages the node answered this round, each push counting as one.
@@ -506,6 +541,7 @@ impl FeedSync {
         &mut self,
         request: &ChangesRequest,
         response: ChangesResponse,
+        afresh: bool,
     ) -> Vec<XorName> {
         let page = match check_changes_page(request, &response) {
             Ok(page) => page,
@@ -537,6 +573,16 @@ impl FeedSync {
             count,
             set_hash,
         });
+        if afresh {
+            // Start again from nothing: read the range afresh, then follow
+            // the feed after where it stands now.
+            self.phase = Phase::Reading {
+                epoch,
+                head,
+                cursor: None,
+            };
+            return self.replace(None, self.range.last(), Vec::new());
+        }
         match page {
             ChangesPage::Restart { epoch, head } => {
                 self.phase = Phase::Reading {
@@ -559,6 +605,7 @@ impl FeedSync {
         &mut self,
         request: &RangeListRequest,
         response: RangeListResponse,
+        afresh: bool,
     ) -> Vec<XorName> {
         let Phase::Reading { epoch, head, .. } = self.phase else {
             return Vec::new();
@@ -572,7 +619,12 @@ impl FeedSync {
         };
         self.pages += 1;
         self.answered = true;
-        let through = next.unwrap_or_else(|| self.range.last());
+        // Starting again from nothing, the rest of the range goes too: the
+        // request asked from its start.
+        let through = match next {
+            Some(next) if !afresh => next,
+            _ => self.range.last(),
+        };
         let touched = self.replace(request.after, through, response.entries);
         if next.is_some() {
             self.phase = Phase::Reading {
@@ -631,12 +683,19 @@ impl FeedSync {
         WALK_FREE_LISTINGS.saturating_add(WALK_PER_BACKED.saturating_mul(self.backed))
     }
 
-    /// Whether the node has earned another page this round, with room in its
-    /// mirror for a full page of new addresses.
-    fn within_allowance(&self) -> bool {
-        let allowance = self.allowance();
-        PAGE.saturating_mul(self.pages + 1) <= allowance
-            && self.entries.len().saturating_add(PAGE) <= allowance
+    /// Whether the node may be asked another page this round: it has earned
+    /// one, and its mirror has room for a full page of new addresses, unless
+    /// the node hasn't answered this round yet (see
+    /// [`next_request`](Self::next_request)).
+    fn may_ask(&self) -> bool {
+        PAGE.saturating_mul(self.pages + 1) <= self.allowance()
+            && (!self.answered || self.has_room())
+    }
+
+    /// Whether the mirror has room within the allowance for a full page of
+    /// new addresses.
+    fn has_room(&self) -> bool {
+        self.entries.len().saturating_add(PAGE) <= self.allowance()
     }
 
     fn missed(&mut self) {
@@ -896,6 +955,13 @@ mod tests {
                 FeedChange::Removed { address, .. } => FeedChange::Removed { seq, address },
             };
             self.rows.insert(seq, change);
+        }
+
+        /// Lose everything served, and number the feed afresh in a new
+        /// epoch: a wiped store.
+        fn wipe(&mut self, epoch: u64) {
+            self.served.clear();
+            self.renumber(epoch);
         }
 
         /// Number everything served afresh, in a new epoch.
@@ -1362,18 +1428,22 @@ mod tests {
         assert_eq!(reader.syncs[0].pages(), 8);
         assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Budget));
         assert_eq!(reader.syncs[0].len(), 7 * PAGE);
-        // The next round fills its free allowance, and after that nothing
-        // more is asked of it.
+        // The next round fills its free allowance. After that, each round
+        // finds no room in its mirror, so the mirror starts again from
+        // nothing and the range is read afresh: eight pages a round, as a
+        // walk reads it, and never more in the mirror.
         reader.round(&mut net, 8);
         assert_eq!(reader.syncs[0].pages(), 1);
         assert_eq!(reader.syncs[0].len(), WALK_FREE_LISTINGS);
         for seed in 9..12 {
             let asked = net.nodes[0].asked;
             reader.round(&mut net, seed);
-            assert_eq!(net.nodes[0].asked, asked);
+            assert_eq!(net.nodes[0].asked, asked + 8);
+            assert_eq!(reader.syncs[0].pages(), 8);
             assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Budget));
             assert_eq!(reader.syncs[0].len(), WALK_FREE_LISTINGS);
         }
+        reader.check_counts();
         for entry in reader.syncs[0].entries() {
             assert!(entry.address.starts_with(&prefix));
             assert_eq!(
@@ -1416,8 +1486,9 @@ mod tests {
             assert!(sync.len() <= allowance);
             total += sync.pages();
         }
-        // Its real entries still earn it a few pages, but its made-up ones
-        // never do: they stop at its allowance.
+        // Its real entries earn it a few pages until its mirror is full,
+        // which then starts again from nothing; its made-up ones never earn
+        // anything, and stop at its allowance.
         assert!(reader.counts[0] <= held);
         assert!(reader.syncs[0].len() <= WALK_FREE_LISTINGS + WALK_PER_BACKED * held);
         assert!(total > 0);
@@ -1668,6 +1739,65 @@ mod tests {
         // What it serves is mirrored all the same; its copies just don't
         // count.
         assert!(reader.mirrors(&net, 4));
+    }
+
+    #[test]
+    fn a_mirror_left_behind_is_put_right_the_next_round_its_node_answers() {
+        // Node 0 misses the round in which most listings go, or the round in
+        // which every node is read afresh after every store was wiped. Its
+        // mirror then holds thousands of entries nobody else serves, far
+        // more than it has earned, and only the node's answers can shrink
+        // it.
+        for wiped in [false, true] {
+            let mut net = Net::new(24, 16);
+            let addresses = net.store(0, 20_000);
+            let mut reader = Reader::new(&net.ids);
+            reader.round(&mut net, 1);
+            assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
+            let held = reader.syncs[0].len();
+            assert!(held > 2 * WALK_FREE_LISTINGS, "{held} entries");
+
+            net.nodes[0].behaviour = Behaviour::Silent;
+            let kept = if wiped {
+                for node in &mut net.nodes {
+                    let epoch = node.epoch;
+                    node.wipe(epoch ^ 0xffff);
+                }
+                net.store(20_000, 3_000)
+            } else {
+                for address in &addresses[..16_000] {
+                    for node in &mut net.nodes {
+                        node.unserve(*address);
+                    }
+                }
+                addresses[16_000..].to_vec()
+            };
+            reader.round(&mut net, 2);
+            assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::NoAnswer));
+            assert_eq!(reader.syncs[0].len(), held);
+            let allowance = WALK_FREE_LISTINGS + WALK_PER_BACKED * reader.counts[0];
+            assert!(
+                held + PAGE > allowance,
+                "{held} entries, {allowance} allowed"
+            );
+
+            // Answering again, its mirror starts again from nothing with its
+            // poll's answer, and its range is read afresh in the same round.
+            net.nodes[0].behaviour = Behaviour::Honest;
+            reader.round(&mut net, 3);
+            let sync = &reader.syncs[0];
+            assert_eq!(sync.outcome(), Some(FeedOutcome::Synced), "wiped: {wiped}");
+            assert!(reader.mirrors(&net, 0));
+            let serves = net.served(0, sync.range()).len();
+            assert_eq!(sync.pages(), 1 + serves.div_ceil(PAGE).max(1));
+            for (node, sync) in reader.syncs.iter().enumerate() {
+                assert_eq!(sync.outcome(), Some(FeedOutcome::Synced), "node {node}");
+            }
+            for address in &kept {
+                assert_eq!(reader.support(address), NEAREST_NODES);
+            }
+            reader.check_counts();
+        }
     }
 
     /// A network in sync, and an address in node 0's leaf it doesn't serve.
