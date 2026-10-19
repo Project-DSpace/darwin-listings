@@ -374,10 +374,12 @@ next request catches up on a missed one.
 `FeedSync`, a state machine that does no I/O, keeps a reader's mirror of one
 node's range. Each round it asks for the changes after the last record it has,
 pages on while the node has more, and once it has reached the node's head
-checks the count and set hash. While they match, the mirror is exact and the
-node's copies count. When they don't, or the node's feed is new to it, it
-reads the range afresh, over several rounds if need be, then follows the feed
-again from the head the node gave when the reading began. It takes a push
+checks the count and set hash. While they match, the mirror is exact, and once
+the node has answered in the round its copies count; a push alone doesn't
+stand in for that answer, so each round asks the node at least once, which
+also renews its watch. When they don't match, or the node's feed is new to it,
+it reads the range afresh, over several rounds if need be, then follows the
+feed again from the head the node gave when the reading began. It takes a push
 that brings the mirror exactly to the node's new head, and leaves any other to
 the next request, so a push that comes before the answer, after it or not at
 all costs at most one more request.

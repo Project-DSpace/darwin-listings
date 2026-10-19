@@ -5,14 +5,15 @@
 //! round (a poll) it asks for the changes after the last record it has
 //! ([`ChangesRequest`]), pages on while the node has more, and once it has
 //! reached the node's head checks its count and set hash against the
-//! node's. While they match, the mirror is exact, and the node's copies can
-//! count ([`FeedSync::in_sync`]). When they don't, or the node's feed is new
-//! to the mirror (another epoch, or a head behind the mirror's), it reads the
-//! range afresh ([`RangeListRequest`]), over several rounds if need be, then
-//! follows the feed again from the head the node gave when the reading
-//! began. A push from a watch ([`ChangesRequest::watch`]) is taken between
-//! polls when it brings the mirror exactly to the node's new head, and left
-//! to the next request otherwise ([`FeedSync::push`]).
+//! node's. While they match, the mirror is exact, and once the node has
+//! answered in the round its copies can count ([`FeedSync::in_sync`]). When
+//! they don't, or the node's feed is new to the mirror (another epoch, or a
+//! head behind the mirror's), it reads the range afresh
+//! ([`RangeListRequest`]), over several rounds if need be, then follows the
+//! feed again from the head the node gave when the reading began. A push
+//! from a watch ([`ChangesRequest::watch`]) is taken between polls when it
+//! brings the mirror exactly to the node's new head, and left to the next
+//! request otherwise ([`FeedSync::push`]).
 //!
 //! A node can make up as many entries as it likes, so a fixed cap on what is
 //! read from a node would cap the index too. As in
@@ -57,8 +58,9 @@ const PAGE: usize = MAX_LIST_LIMIT as usize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedOutcome {
-    /// The mirror is at the head the node reported this round, with the
-    /// count and set hash it reported: its copies count.
+    /// The node answered this round, and the mirror is at the head it
+    /// reported this round, with the count and set hash it reported: its
+    /// copies count.
     Synced,
     /// The node had been asked for all it had earned before the mirror got
     /// there: the rest waits for the next round.
@@ -102,6 +104,8 @@ pub struct FeedSync {
     backed: usize,
     /// Pages answered this round, pushes included.
     pages: usize,
+    /// Whether the node has answered a request this round.
+    answered: bool,
     retries: usize,
     asked: Option<Asked>,
     /// Where the node said its feed stood this round, furthest on.
@@ -157,6 +161,7 @@ impl FeedSync {
             set_hash: SetHash::EMPTY,
             backed: 0,
             pages: 0,
+            answered: false,
             retries: 0,
             asked: None,
             reported: None,
@@ -202,6 +207,7 @@ impl FeedSync {
     /// pages.
     pub fn begin_round(&mut self) {
         self.pages = 0;
+        self.answered = false;
         self.retries = 0;
         self.asked = None;
         self.reported = None;
@@ -306,10 +312,11 @@ impl FeedSync {
     /// whose request id is [`push_request_id`](crate::push_request_id) of
     /// the id of a request that set a watch, whether it comes before or after
     /// that request's answer. Taken if it brings the mirror exactly to the
-    /// push's head, which then counts as the node's report this round. If it
-    /// doesn't, the node is ahead of the mirror, and
-    /// [`next_request`](Self::next_request) asks it to catch up. Check that
-    /// the push came from the node before passing it in.
+    /// push's head: the push is then the node's report this round, and the
+    /// mirror is in sync once the node has also answered a request this
+    /// round. If it doesn't bring the mirror there, the node is ahead of the
+    /// mirror, and [`next_request`](Self::next_request) asks it to catch up.
+    /// Check that the push came from the node before passing it in.
     pub fn push(&mut self, push: &ChangesResponse) -> Pushed {
         if self.phase != Phase::Following
             || push.epoch != self.epoch
@@ -386,11 +393,15 @@ impl FeedSync {
         outside
     }
 
-    /// Whether the mirror is at the head the node reported this round, with
-    /// the count and set hash it reported there: whether its copies count.
+    /// Whether the node has answered a request this round, and the mirror is
+    /// at the head the node reported this round, with the count and set hash
+    /// it reported there: whether its copies count. A push alone doesn't
+    /// make a round's mirror in sync, so each round asks the node at least
+    /// once, which also renews its watch.
     #[must_use]
     pub fn in_sync(&self) -> bool {
-        self.phase == Phase::Following
+        self.answered
+            && self.phase == Phase::Following
             && self.reported.is_some_and(|report| {
                 report.epoch == self.epoch && report.head == self.head && self.matches(&report)
             })
@@ -504,6 +515,7 @@ impl FeedSync {
             }
         };
         self.pages += 1;
+        self.answered = true;
         let ChangesResponse {
             epoch,
             head,
@@ -559,6 +571,7 @@ impl FeedSync {
             }
         };
         self.pages += 1;
+        self.answered = true;
         let through = next.unwrap_or_else(|| self.range.last());
         let touched = self.replace(request.after, through, response.entries);
         if next.is_some() {
@@ -1819,6 +1832,36 @@ mod tests {
             assert_eq!(reader.syncs[0].pages(), 3);
             assert!(reader.mirrors(&net, 0));
         }
+    }
+
+    #[test]
+    fn a_push_before_the_rounds_poll_does_not_stand_in_for_it() {
+        let (mut net, mut reader, address) = synced();
+        let range = reader.syncs[0].range();
+        reader.syncs[0].begin_round();
+        // A new listing, pushed before the round's poll is sent.
+        net.nodes[0].serve(real(address, 9_999));
+        let push = net.nodes[0].push(range, reader.syncs[0].head());
+        assert_eq!(reader.syncs[0].push(&push), Pushed::Applied(vec![address]));
+        assert_eq!(reader.syncs[0].head(), net.nodes[0].head);
+        // The mirror is at the node's head, but the node hasn't answered
+        // this round: its copies don't count yet, and the poll, which renews
+        // the watch, is still sent.
+        assert!(!reader.syncs[0].in_sync());
+        assert_eq!(reader.syncs[0].outcome(), None);
+        let Some(ListingsBody::ChangesRequest(request)) = reader.syncs[0].next_request(false, true)
+        else {
+            panic!("a changes request");
+        };
+        assert!(request.watch);
+        assert_eq!(request.after, net.nodes[0].head);
+        let answer = net.nodes[0]
+            .answer(&ListingsBody::ChangesRequest(request))
+            .unwrap();
+        assert!(reader.syncs[0].answer(answer).is_empty());
+        assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
+        assert_eq!(reader.syncs[0].pages(), 2);
+        assert!(reader.mirrors(&net, 0));
     }
 
     #[test]
