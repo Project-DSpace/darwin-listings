@@ -87,9 +87,9 @@ pub use listing::{
 };
 pub use message::{
     check_changes_page, check_get_response, check_list_page, check_push, check_range_page,
-    ChangesPage, ChangesRequest, ChangesResponse, FeedError, ListingsBody, ListingsMessage,
-    MessageError, PageError, RangeListRequest, RangeListResponse, MAX_LIST_LIMIT, MAX_WATCHERS,
-    TOPIC, VIEW_PEERS, WATCH_LEASE,
+    push_request_id, ChangesPage, ChangesRequest, ChangesResponse, FeedError, ListingsBody,
+    ListingsMessage, MessageError, PageError, RangeListRequest, RangeListResponse, MAX_LIST_LIMIT,
+    MAX_WATCHERS, TOPIC, VIEW_PEERS, WATCH_LEASE,
 };
 pub use payment::{
     check_offline, choose_verified, find_payment, payment_lookup, quorum_needed, verify_listing,

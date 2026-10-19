@@ -357,16 +357,19 @@ address order. A response with more than 256 records or entries, or more than
 20 peers, doesn't decode.
 
 A `ChangesRequest` with `watch` set asks the node to send the range's new
-records as it makes them. The node answers the request first, then sends each
-new record in the range as a `ChangesResponse` with the request's id, a push:
-`next` at its head, `more` false, no peers, and the range's count and set hash
-at that head. So the first message with that id is the answer, and any later
-one a push. A watch lasts until the requester's next `ChangesRequest` to the
-node, which sets a new one if it asks for one, or for three minutes if none
-comes: the minute until its next poll, and two more. A node keeps at most four
-watches at once, so a watch asked for may not be set; the requester can't
-tell. Pushes are never acknowledged: the next request catches up on a missed
-one.
+records as it makes them, each as a `ChangesResponse` whose request id is the
+bitwise complement of the request's (`push_request_id`), a push: `next` at its
+head, `more` false, no peers, and the range's count and set hash at that head.
+The answer to the request has the request's own id. Messages can overtake one
+another on the way, so a push can arrive before the answer: a requester tells
+them apart by id alone, never by the order they arrive in. No id a requester
+uses with a node should be the complement of another it uses with the node,
+which ids chosen at random almost never are. A watch lasts until the
+requester's next `ChangesRequest` to the node, which sets a new one if it asks
+for one, or for three minutes if none comes: the minute until its next poll,
+and two more. A node keeps at most four watches at once, so a watch asked for
+may not be set; the requester can't tell. Pushes are never acknowledged: the
+next request catches up on a missed one.
 
 `FeedSync`, a state machine that does no I/O, keeps a reader's mirror of one
 node's range. Each round it asks for the changes after the last record it has,
@@ -376,8 +379,8 @@ node's copies count. When they don't, or the node's feed is new to it, it
 reads the range afresh, over several rounds if need be, then follows the feed
 again from the head the node gave when the reading began. It takes a push
 that brings the mirror exactly to the node's new head, and leaves any other to
-the next request, so a push that comes early, late or not at all does no
-harm.
+the next request, so a push that comes before the answer, after it or not at
+all costs at most one more request.
 
 A node can make up entries without end, so each node is read within the same
 allowance as a walk: 2,048 entries' worth of pages a round, and two more for

@@ -57,6 +57,19 @@ pub const MAX_WATCHERS: usize = 4;
 /// the node: the minute until its next poll, and two minutes more.
 pub const WATCH_LEASE: u64 = 180;
 
+/// The request id of a push ([`ChangesRequest::watch`]): the bitwise
+/// complement of the id of the request that set the watch. The answer to
+/// that request has the request's own id, so a requester tells pushes from
+/// the answer by id alone, whichever arrives first: messages can overtake
+/// one another on the way. The complement of a push's id is the watching
+/// request's. No id a requester uses with a node should be the complement of
+/// another it uses with the node, which ids chosen at random almost never
+/// are.
+#[must_use]
+pub const fn push_request_id(request_id: u64) -> u64 {
+    !request_id
+}
+
 /// A request or response, with an id the response echoes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListingsMessage {
@@ -149,10 +162,11 @@ pub struct ChangesRequest {
     /// Whether to list the node's nearest peers in the answer's `peers`.
     pub want_peers: bool,
     /// Whether to be sent the range's new records as the node makes them.
-    /// The node answers this request first, then sends each new record in
-    /// the range as a [`ChangesResponse`] with this request's id: a push.
-    /// The watch lasts until the requester's next `ChangesRequest` to the
-    /// node, which sets a new one if it asks for one, or [`WATCH_LEASE`]
+    /// The node sends each new record in the range as a [`ChangesResponse`]
+    /// whose request id is [`push_request_id`] of this request's: a push. A
+    /// push can arrive before this request's answer; the id tells them
+    /// apart. The watch lasts until the requester's next `ChangesRequest` to
+    /// the node, which sets a new one if it asks for one, or [`WATCH_LEASE`]
     /// seconds if none comes. A node keeps at most [`MAX_WATCHERS`] watches.
     /// A missed push is caught by the next request, so pushes are never
     /// acknowledged. Check each with [`check_push`].
@@ -174,9 +188,10 @@ impl ChangesRequest {
 /// `head`, so a reader whose mirror has reached `head` can check it.
 ///
 /// A push carries new records, with `next` equal to `head`, `more` false and
-/// no peers. It has the request id of the request that set the watch, and is
-/// sent only after that request's answer: the first message with that id is
-/// the answer, and any later one a push.
+/// no peers. Its request id is [`push_request_id`] of the id of the request
+/// that set the watch, while the answer to that request has the request's
+/// own: a requester tells them apart by id alone, in whatever order they
+/// arrive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangesResponse {
     /// The node's epoch: random, never 0, and new whenever the node numbers
@@ -423,10 +438,10 @@ pub fn check_changes_page(
 }
 
 /// Check a push: a [`ChangesResponse`] a node sent for a watch on `range`
-/// ([`ChangesRequest::watch`]). It must give an epoch other than 0, have
-/// `next` at `head`, `more` false and no peers, and carry at most
-/// [`MAX_LIST_LIMIT`] changes in `range`, one per address, numbered in
-/// increasing order up to `head`.
+/// ([`ChangesRequest::watch`]), with [`push_request_id`] of the watching
+/// request's id. It must give an epoch other than 0, have `next` at `head`,
+/// `more` false and no peers, and carry at most [`MAX_LIST_LIMIT`] changes
+/// in `range`, one per address, numbered in increasing order up to `head`.
 ///
 /// # Errors
 ///
@@ -2180,5 +2195,40 @@ mod tests {
             refused(|bad| bad.changes[1] = removed_at(12, address(0x81, 1))),
             Err(FeedError::RepeatedAddress)
         );
+    }
+
+    #[test]
+    fn pushes_have_the_complement_of_the_watching_requests_id() {
+        assert_eq!(push_request_id(0), u64::MAX);
+        assert_eq!(push_request_id(7), 0xffff_ffff_ffff_fff8);
+        for id in [0, 1, 7, 300, u64::MAX / 2, u64::MAX / 2 + 1, u64::MAX] {
+            // Never the request's own id, and the request's from the push's.
+            assert_ne!(push_request_id(id), id);
+            assert_eq!(push_request_id(push_request_id(id)), id);
+        }
+        // On the wire: a push for a watch that request 7 set.
+        let push = ListingsMessage {
+            request_id: push_request_id(7),
+            body: ListingsBody::ChangesResponse(changes_response(
+                12,
+                12,
+                vec![removed_at(12, address(0x90, 2))],
+            )),
+        };
+        let ListingsBody::ChangesResponse(response) = &push.body else {
+            unreachable!()
+        };
+        assert_eq!(
+            check_push(AddressRange::new([0x80; 32], 1), response),
+            Ok(())
+        );
+        let bytes = push.encode().unwrap();
+        let expected = crate::proof::decode_hex(concat!(
+            "f8ffffffffffffffff01", // request id: the complement of 7
+            "06",                   // ChangesResponse
+        ))
+        .unwrap();
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert_eq!(ListingsMessage::decode(&bytes), Ok(push));
     }
 }

@@ -223,8 +223,11 @@ impl FeedSync {
     /// its answer, once the round has ended, or while the mirror is in sync.
     /// It is marked as waiting for its answer. `want_peers` and `watch` go
     /// into a [`ChangesRequest`] (see there), and are left out of a
-    /// [`RangeListRequest`]. Send each request with a request id of its own:
-    /// pushes for a watch come with the id of the request that set it.
+    /// [`RangeListRequest`]. Send each request with a request id of its own.
+    /// A watch's pushes come with
+    /// [`push_request_id`](crate::push_request_id) of the id of the request
+    /// that set it, and can arrive before that request's answer: pass them to
+    /// [`push`](Self::push).
     pub fn next_request(&mut self, want_peers: bool, watch: bool) -> Option<ListingsBody> {
         if self.ended.is_some() || self.asked.is_some() || self.in_sync() {
             return None;
@@ -299,11 +302,14 @@ impl FeedSync {
         }
     }
 
-    /// A push from the node's watch on this range: taken if it brings the
-    /// mirror exactly to the push's head, which then counts as the node's
-    /// report this round. If it doesn't, the node is ahead of the mirror,
-    /// and [`next_request`](Self::next_request) asks it to catch up. Check
-    /// that the push came from the node before passing it in.
+    /// A push from the node's watch on this range: a message from the node
+    /// whose request id is [`push_request_id`](crate::push_request_id) of
+    /// the id of a request that set a watch, whether it comes before or after
+    /// that request's answer. Taken if it brings the mirror exactly to the
+    /// push's head, which then counts as the node's report this round. If it
+    /// doesn't, the node is ahead of the mirror, and
+    /// [`next_request`](Self::next_request) asks it to catch up. Check that
+    /// the push came from the node before passing it in.
     pub fn push(&mut self, push: &ChangesResponse) -> Pushed {
         if self.phase != Phase::Following
             || push.epoch != self.epoch
@@ -1782,6 +1788,37 @@ mod tests {
         assert_eq!(reader.syncs[0].head(), head + 2);
         assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
         assert!(reader.mirrors(&net, 0));
+    }
+
+    #[test]
+    fn a_push_that_overtakes_its_answer_does_no_harm() {
+        // Pushes are told from answers by request id, so a push that comes
+        // first is passed to push and the answer to answer, whether or not
+        // the request asked for peers.
+        for want_peers in [false, true] {
+            let (mut net, mut reader, address) = synced();
+            let range = reader.syncs[0].range();
+            let other = made_up(&net.ids[0][..8], 2);
+            // A change the poll's answer carries, then one pushed after it.
+            net.nodes[0].serve(real(other, 9_998));
+            reader.syncs[0].begin_round();
+            let request = reader.syncs[0].next_request(want_peers, true).unwrap();
+            let answer = net.nodes[0].answer(&request).unwrap();
+            let head = net.nodes[0].head;
+            net.nodes[0].serve(real(address, 9_999));
+            let push = net.nodes[0].push(range, head);
+            // The push arrives first: it lacks the answer's record.
+            assert_eq!(reader.syncs[0].push(&push), Pushed::Behind);
+            assert_eq!(reader.syncs[0].answer(answer), vec![other]);
+            assert!(!reader.syncs[0].in_sync());
+            // One more request catches up with the push.
+            let request = reader.syncs[0].next_request(want_peers, true).unwrap();
+            let answer = net.nodes[0].answer(&request).unwrap();
+            assert_eq!(reader.syncs[0].answer(answer), vec![address]);
+            assert_eq!(reader.syncs[0].outcome(), Some(FeedOutcome::Synced));
+            assert_eq!(reader.syncs[0].pages(), 3);
+            assert!(reader.mirrors(&net, 0));
+        }
     }
 
     #[test]
