@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 
 pub mod envelope;
+pub mod feed;
 pub mod flags;
 pub mod listing;
 pub mod message;
@@ -54,6 +55,7 @@ pub mod walk;
 
 #[cfg(test)]
 mod test_support;
+mod wire;
 
 /// The `self_encryption` version envelopes are built with, re-exported so
 /// callers build data maps with the same one.
@@ -63,6 +65,9 @@ pub use envelope::{
     encode_data_map, is_envelope, needs_envelope, salted_hash, Envelope, EnvelopeError, Metadata,
     Salt, ENVELOPE_VERSION, ENVELOPE_VERSION_1, MAGIC, MAX_CONTENT_TYPE_LEN, MAX_NAME_LEN,
     SALTED_HASH_LEN, SALT_LEN,
+};
+pub use feed::{
+    leaf_index, leaves, view_hash, AddressRange, DigestEntry, FeedChange, Leaf, SetHash,
 };
 pub use flags::{Flags, PaymentField, ShownFields};
 pub use listing::{
