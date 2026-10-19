@@ -364,8 +364,9 @@ at that head. So the first message with that id is the answer, and any later
 one a push. A watch lasts until the requester's next `ChangesRequest` to the
 node, which sets a new one if it asks for one, or for three minutes if none
 comes: the minute until its next poll, and two more. A node keeps at most four
-watches; one asked for beyond that is not set. Pushes are never acknowledged:
-the next request catches up on a missed one.
+watches at once, so a watch asked for may not be set; the requester can't
+tell. Pushes are never acknowledged: the next request catches up on a missed
+one.
 
 `FeedSync`, a state machine that does no I/O, keeps a reader's mirror of one
 node's range. Each round it asks for the changes after the last record it has,
