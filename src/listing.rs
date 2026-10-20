@@ -844,6 +844,12 @@ pub fn listing_to_check<P: PartialEq>(
 /// earlier than every other date that passes, whatever they send: early
 /// dates, dates that fail, or nothing. `needed` agreeing dates still can.
 ///
+/// Dating it later takes less. Where at most `needed` dates pass, or
+/// `needed` is 0, it is the latest of them, so any one node whose date
+/// passes can date it later, as late as `check` allows: with
+/// [`verify_listing_receipts`](crate::verify_listing_receipts), the checker's
+/// clock plus [`CLOCK_MARGIN`].
+///
 /// `check` is typically [`verify_listing_receipts`](crate::verify_listing_receipts)
 /// over what was fetched. It is called once for each different date, so it
 /// must give the same answer for the same listing.

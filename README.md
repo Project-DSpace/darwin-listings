@@ -122,7 +122,11 @@ date it then or earlier: with all seven passing, their median. Where fewer
 pass, it is the latest of them. So a listing is never dated earlier than a
 quorum of passing values put it, however many nodes serve it: nodes fewer
 than a quorum can't date it earlier than every other passing value, whether
-they send early values, values that fail, or none. Other nodes can't move it,
+they send early values, values that fail, or none. Dating it later takes
+less. Where no more than a quorum of values pass, the latest of them counts,
+since any earlier one would let fewer than a quorum date it earlier. So any
+one node whose value passes can date it later, up to the checker's clock
+plus an hour (see Checks). Nodes further from its address can't move it,
 however many there are.
 
 Listings in the index are sorted by key: time, block number, log index and
