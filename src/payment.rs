@@ -250,7 +250,7 @@ pub enum Lookup {
 /// uploader declared. `first_seen` is only checked not to be in the future,
 /// and not to be before the payment where the payment's block is known: take
 /// it from the nodes nearest the address
-/// ([`MergedListing::checked_listing_among`]), at either level.
+/// ([`check_copies`](crate::check_copies)), at either level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckLevel {
@@ -323,7 +323,7 @@ pub struct ChosenVerified<T> {
 ///
 /// Each of `checked` is a group of copies for the address, what the caller
 /// wants back with it (such as the listing
-/// [`MergedListing::checked_listing_among`] gave), and that listing's check.
+/// [`check_copies`](crate::check_copies) gave), and that listing's check.
 /// [`CheckLevel::Reported`] ones are ignored. `nearest` is the nodes nearest
 /// the address for an indexer, or the close-group peers asked for a node
 /// repairing a listing.
@@ -734,8 +734,8 @@ mod tests {
     use super::*;
     use crate::envelope::{Metadata, Salt};
     use crate::flags::{Flags, PaymentField, ShownFields};
-    use crate::listing::{first_seen_at, merge_copies, FIRST_SEEN_ROUNDING};
-    use crate::listing::{ListingV1, PaymentV1};
+    use crate::listing::{check_copies, first_seen_at, listing_to_check, merge_copies};
+    use crate::listing::{ListingV1, PaymentV1, FIRST_SEEN_ROUNDING};
     use crate::proof::{check_proof, EnvelopeProof};
     use crate::test_support::{
         data_map, metadata, payment_log, receipt, self_issued_quote, signed_quote, signed_quote_at,
@@ -889,9 +889,12 @@ mod tests {
             self.chain.verify(listing, &self.envelope)
         }
 
-        /// Check a group of copies as a caller does: fetch once, for the
-        /// listing as the nearest nodes' median gives it, then check the
-        /// listing, with each nearest node's `first_seen`, against that.
+        /// Check a group of copies with
+        /// [`checked_listing_among`](crate::MergedListing::checked_listing_among):
+        /// fetch once, for the listing as the nearest nodes' median gives
+        /// it, then check the listing, with each nearest node's
+        /// `first_seen`, against that, and date it by the median of the
+        /// values that pass.
         fn check_group(
             &self,
             group: &crate::MergedListing<u8>,
@@ -902,6 +905,25 @@ mod tests {
                 None => Vec::new(),
             };
             group.checked_listing_among(nearest, |listing| {
+                verify_listing_receipts(listing, &self.envelope, &fetched, &VAULT, NOW)
+            })
+        }
+
+        /// Check a group of copies as indexers and repairing nodes do: fetch
+        /// once, for the listing [`listing_to_check`] gives, then date and
+        /// check the group with [`check_copies`], `needed` of the nearest
+        /// nodes making a quorum.
+        fn check_copies(
+            &self,
+            group: &crate::MergedListing<u8>,
+            nearest: &[u8],
+            needed: usize,
+        ) -> Result<(Listing, ListingCheck), PaymentError> {
+            let fetched = match listing_to_check(group, nearest, needed) {
+                Some(listing) => self.chain.fetch(payment_lookup(&listing)?),
+                None => Vec::new(),
+            };
+            check_copies(group, nearest, needed, |listing| {
                 verify_listing_receipts(listing, &self.envelope, &fetched, &VAULT, NOW)
             })
         }
@@ -2394,6 +2416,102 @@ mod tests {
                 let (listing, checked) = fixture.check_group(&groups[0], &nearest).unwrap();
                 assert_eq!(checked.level, CheckLevel::Reported);
                 assert_eq!(listing.first_seen, Some(expected), "{values:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_minority_cannot_backdate_with_dates_that_fail() {
+        // In the index, hiding all five: nothing bounds first_seen from
+        // below, so only the nearest nodes' dates can date it, and only a
+        // quorum of them earlier.
+        let nearest: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+        let needed = quorum_needed(nearest.len());
+        let future = first_seen_at(4_102_444_800);
+        for withheld in [false, true] {
+            let fixture = fixture_flags(Flags {
+                shown: ShownFields::NONE,
+                in_index: true,
+                withheld,
+            });
+            let honest = fixture.listing();
+            let h = honest.first_seen.unwrap();
+            for (values, expected) in [
+                // Three colluders and an honest node serve it: two date it in
+                // 1970, and the third in the future, so that only three dates
+                // pass.
+                (vec![0, 0, future, h], h),
+                (vec![future, h, 0, 0], h),
+                (vec![0, 0, future, h, h], h),
+                // Fewer than a quorum serve it.
+                (vec![0, 0, h], h),
+                // Four dating it in 1970 are a quorum of the seven.
+                (vec![0, 0, 0, 0, future, h, h], 0),
+            ] {
+                let groups = merge_copies(copies_with_first_seen(&honest, &values));
+                assert_eq!(groups.len(), 1);
+                let (listing, checked) =
+                    fixture.check_copies(&groups[0], &nearest, needed).unwrap();
+                assert_eq!(checked.level, CheckLevel::Reported);
+                assert_eq!(listing.first_seen, Some(expected), "{values:?}");
+            }
+            // The median of the three dates that pass is 1970.
+            let groups = merge_copies(copies_with_first_seen(&honest, &[0, 0, future, h]));
+            let (listing, _) = fixture.check_group(&groups[0], &nearest).unwrap();
+            assert_eq!(listing.first_seen, Some(0));
+        }
+    }
+
+    #[test]
+    fn copies_are_dated_by_a_quorum_of_the_values_in_bounds() {
+        let nearest: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
+        let needed = quorum_needed(nearest.len());
+        let backdated = 0;
+        let pinned = first_seen_at(4_102_444_800);
+        for flags in dated_by_first_seen() {
+            let fixture = fixture_flags(flags);
+            let honest = fixture.listing();
+            let h = honest.first_seen.unwrap();
+            let located = payment_lookup(&honest).unwrap() != Lookup::Nothing;
+            let level = fixture.verify(&honest).unwrap();
+            for values in [
+                vec![backdated, backdated, pinned, h],
+                vec![backdated, backdated, backdated, h, h, h],
+                vec![h, pinned, h, pinned, h, pinned],
+                vec![backdated, h],
+                vec![
+                    backdated,
+                    pinned,
+                    h,
+                    h + FIRST_SEEN_ROUNDING,
+                    backdated,
+                    pinned,
+                ],
+                vec![h + FIRST_SEEN_ROUNDING, h, h - FIRST_SEEN_ROUNDING, h],
+            ] {
+                let groups = merge_copies(copies_with_first_seen(&honest, &values));
+                assert_eq!(groups.len(), 1);
+                // The values in bounds: never one in the future, and none
+                // before the payment where anything locates it.
+                let mut in_bounds: Vec<u64> = values
+                    .iter()
+                    .copied()
+                    .filter(|&value| value != pinned && (!located || value != backdated))
+                    .collect();
+                in_bounds.sort_unstable();
+                // The latest of the earliest `needed` of them, or, with
+                // fewer, of them all. Fewer than four nodes date it early
+                // here, so never before the honest hour.
+                let expected = in_bounds
+                    .get(needed - 1)
+                    .or(in_bounds.last())
+                    .copied()
+                    .unwrap();
+                assert!(expected >= h, "{flags:?}, {values:?}");
+                let (listing, checked) =
+                    fixture.check_copies(&groups[0], &nearest, needed).unwrap();
+                assert_eq!(listing.first_seen, Some(expected), "{flags:?}, {values:?}");
+                assert_eq!(checked.level, level, "{flags:?}, {values:?}");
             }
         }
     }
