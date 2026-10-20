@@ -890,11 +890,13 @@ mod tests {
         }
 
         /// Check a group of copies with
-        /// [`checked_listing_among`](crate::MergedListing::checked_listing_among):
-        /// fetch once, for the listing as the nearest nodes' median gives
-        /// it, then check the listing, with each nearest node's
+        /// [`checked_listing_among`](crate::MergedListing::checked_listing_among),
+        /// which is deprecated but still public, so what it does stays
+        /// pinned: fetch once, for the listing as the nearest nodes' median
+        /// gives it, then check the listing, with each nearest node's
         /// `first_seen`, against that, and date it by the median of the
         /// values that pass.
+        #[allow(deprecated)]
         fn check_group(
             &self,
             group: &crate::MergedListing<u8>,
@@ -1711,17 +1713,19 @@ mod tests {
         (listing, proof, theirs)
     }
 
-    /// Check each of `groups` as a caller does, against the chain, with
-    /// `first_seen` from `nearest`, and choose among the verified ones.
+    /// Check each of `groups` as a caller does, against the chain with
+    /// [`check_copies`], `first_seen` from `nearest` and a quorum of them,
+    /// and choose among the verified ones.
     fn choose(
         fixture: &Fixture,
         groups: &[crate::MergedListing<u8>],
         nearest: &[u8],
     ) -> Option<ChosenVerified<Listing>> {
+        let needed = quorum_needed(nearest.len());
         let checked: Vec<_> = groups
             .iter()
             .filter_map(|group| {
-                let (listing, check) = fixture.check_group(group, nearest).ok()?;
+                let (listing, check) = fixture.check_copies(group, nearest, needed).ok()?;
                 Some((group, listing, check))
             })
             .collect();
@@ -1872,7 +1876,7 @@ mod tests {
         let counted: Vec<(Listing, usize)> = groups
             .iter()
             .filter_map(|group| {
-                let (listing, check) = reported.check_group(group, &nearest).ok()?;
+                let (listing, check) = reported.check_copies(group, &nearest, needed).ok()?;
                 assert_eq!(check.level, CheckLevel::Reported);
                 Some((listing, group.count_among(&nearest)))
             })
@@ -2312,6 +2316,9 @@ mod tests {
 
     #[test]
     fn values_out_of_bounds_neither_fail_nor_move_first_seen() {
+        // Dated by the median, with the deprecated checked_listing_among;
+        // copies_are_dated_by_a_quorum_of_the_values_in_bounds does the same
+        // with check_copies.
         let nearest: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
         let backdated = 0;
         let pinned = first_seen_at(4_102_444_800);
@@ -2388,7 +2395,8 @@ mod tests {
     #[test]
     fn a_minority_cannot_backdate_a_listing_nothing_locates() {
         // In the index, hiding all five: nothing bounds first_seen from
-        // below, so only the median protects it.
+        // below, so only the nearest nodes' dates protect it. Dated by the
+        // median, with the deprecated checked_listing_among.
         let nearest: [u8; 7] = [1, 2, 3, 4, 5, 6, 7];
         let needed = quorum_needed(nearest.len());
         for withheld in [false, true] {
@@ -2399,7 +2407,7 @@ mod tests {
             });
             let honest = fixture.listing();
             let h = honest.first_seen.unwrap();
-            for (values, expected) in [
+            for (values, median) in [
                 // Four of seven serve it, two of them colluding: a quorum,
                 // but the colluders can't set the time.
                 (vec![h, 0, h, 0], h),
@@ -2407,7 +2415,8 @@ mod tests {
                 (vec![0, h, 0, h, 0, h], h),
                 // Three of seven colluding, all seven answering.
                 (vec![0, 0, 0, h, h, h, h], h),
-                // Colluders who are most of those answering decide.
+                // Colluders who are most of those answering decide the
+                // median.
                 (vec![0, 0, 0, h], 0),
             ] {
                 let groups = merge_copies(copies_with_first_seen(&honest, &values));
@@ -2415,7 +2424,13 @@ mod tests {
                 assert!(groups[0].count_among(&nearest) >= needed);
                 let (listing, checked) = fixture.check_group(&groups[0], &nearest).unwrap();
                 assert_eq!(checked.level, CheckLevel::Reported);
-                assert_eq!(listing.first_seen, Some(expected), "{values:?}");
+                assert_eq!(listing.first_seen, Some(median), "{values:?}");
+                // check_copies takes four dates to date it earlier, and
+                // fewer than four collude here.
+                let (listing, checked) =
+                    fixture.check_copies(&groups[0], &nearest, needed).unwrap();
+                assert_eq!(checked.level, CheckLevel::Reported);
+                assert_eq!(listing.first_seen, Some(h), "{values:?}");
             }
         }
     }
@@ -2455,7 +2470,8 @@ mod tests {
                 assert_eq!(checked.level, CheckLevel::Reported);
                 assert_eq!(listing.first_seen, Some(expected), "{values:?}");
             }
-            // The median of the three dates that pass is 1970.
+            // The deprecated checked_listing_among takes the median of the
+            // three dates that pass: 1970.
             let groups = merge_copies(copies_with_first_seen(&honest, &[0, 0, future, h]));
             let (listing, _) = fixture.check_group(&groups[0], &nearest).unwrap();
             assert_eq!(listing.first_seen, Some(0));

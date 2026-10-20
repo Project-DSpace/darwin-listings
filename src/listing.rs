@@ -635,6 +635,11 @@ impl<P: PartialEq> MergedListing<P> {
     /// [`ListingError::MissingFirstSeen`] if none of `nearest` returned it,
     /// and if no value passes, the error `check` gave for the median of them
     /// all. For any other listing, the error `check` gave for it.
+    #[deprecated(
+        since = "0.3.1",
+        note = "dates a listing by the median of the values that pass, which fewer than a \
+                quorum of the nearest nodes can move earlier; use check_copies"
+    )]
     pub fn checked_listing_among(
         &self,
         nearest: &[P],
@@ -1815,6 +1820,9 @@ mod tests {
         );
     }
 
+    // checked_listing_among is deprecated but still public, so what it does
+    // stays pinned.
+    #[allow(deprecated)]
     #[test]
     fn checked_listings_drop_values_that_fail_on_their_own() {
         use crate::payment::{CheckLevel, ListingCheck, PaymentError};
@@ -2062,6 +2070,8 @@ mod tests {
         }
     }
 
+    // Compares check_copies with the deprecated checked_listing_among.
+    #[allow(deprecated)]
     #[test]
     fn fewer_than_a_quorum_cannot_backdate_with_dates_that_fail() {
         let honest = unlocated();
