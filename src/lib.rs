@@ -70,6 +70,8 @@ pub mod root;
 pub mod walk;
 
 #[cfg(test)]
+mod census;
+#[cfg(test)]
 mod test_support;
 mod wire;
 
