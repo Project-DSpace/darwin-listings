@@ -26,13 +26,24 @@
 //! ([`leaf_key`]): the check a storer makes before it reads the vault's
 //! record under that key.
 //!
+//! Each wave a root vault records logs, in this order: one `DataPaymentMade`
+//! for each payment, as the per-quote vault logs a paid quote
+//! ([`DATA_PAYMENT_MADE_TOPIC`]); one `RootPaid` naming the wave's key, its
+//! payer, its leaf count and its total ([`ROOT_PAID_TOPIC`]); then one token
+//! `Transfer` from the payer to each distinct payee, of the sum of its
+//! payments, in the order the payees first appear ([`TRANSFER_TOPIC`],
+//! [`Wave::sums`]). A wave sent again, under a key already recorded, moves
+//! nothing and logs nothing. [`recorded_wave`] reads a wave back from the
+//! receipt of the transaction that recorded it.
+//!
 //! The vault's own test vectors are kept in `src/root/vectors/`, and every
 //! function here is checked against them.
 
+use crate::payment::{PaymentLog, PaymentReceipt, RootVault, DATA_PAYMENT_MADE_TOPIC};
 use ant_protocol::evm::Amount;
 use sha3::{Digest, Keccak256};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 /// The most payments a wave holds: a root vault's leaf limit.
@@ -41,6 +52,23 @@ pub const LEAF_LIMIT: u64 = 512;
 /// The most hashes a path holds: one for each level above the leaves of a
 /// wave of [`LEAF_LIMIT`] payments.
 pub const MAX_PATH_LEN: usize = 9;
+
+/// `keccak256("RootPaid(bytes32,address,uint256,uint256)")`: the event a
+/// root vault logs once for each wave it records, after the wave's
+/// `DataPaymentMade` logs. The key is its one indexed field, topic 1; its data
+/// is the payer, the leaf count and the total, one 32-byte word each.
+pub const ROOT_PAID_TOPIC: [u8; 32] = [
+    0x59, 0xbc, 0x12, 0xd0, 0x04, 0x00, 0x84, 0x1d, 0x77, 0xb5, 0x41, 0x52, 0x62, 0xa9, 0xf9, 0x2a,
+    0x97, 0x64, 0xd9, 0x90, 0x7e, 0x0a, 0xd0, 0xbb, 0xf0, 0x0b, 0xbd, 0xe3, 0x4c, 0x02, 0xd1, 0x9a,
+];
+
+/// `keccak256("Transfer(address,address,uint256)")`: a token's transfer
+/// event. The sender and the receiver are topics 1 and 2, and the amount is
+/// its data.
+pub const TRANSFER_TOPIC: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
+];
 
 /// Keccak-256, as Ethereum computes it, over `parts` joined.
 fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
@@ -320,6 +348,228 @@ impl Wave {
         }
         sums
     }
+}
+
+/// A wave a root vault recorded, as the receipt of the transaction that
+/// recorded it shows it ([`recorded_wave`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedWave {
+    /// The wave: its payments, in order, and its tree.
+    pub wave: Wave,
+    /// The key the wave is recorded under, which its `RootPaid` log names.
+    pub key: [u8; 32],
+    /// The payer its `RootPaid` log names: the account that sent the wave,
+    /// from which every transfer comes.
+    pub payer: [u8; 20],
+    /// The log index of the wave's first `DataPaymentMade` log. Payment `i`'s
+    /// log is at `first_log_index + i`, and `RootPaid` follows the last.
+    pub first_log_index: u64,
+}
+
+/// Why a receipt doesn't show a wave whole, as a root vault logs a wave it
+/// records ([`recorded_wave`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WaveLogError {
+    /// The vault's `DataPaymentMade` logs from the given one on don't run on
+    /// to a `RootPaid` log of the vault.
+    #[error("no RootPaid log follows the payment's log")]
+    NoRootPaid,
+    /// The `RootPaid` log is not as the vault writes it: the key as its one
+    /// indexed field, and three words of data, an address for the payer, a
+    /// leaf count from 1 to [`LEAF_LIMIT`] and the total.
+    #[error("the RootPaid log is malformed")]
+    BadRootPaid,
+    /// The leaf count's logs right before `RootPaid` are not all the vault's
+    /// `DataPaymentMade` logs with an address for a payee, or don't hold the
+    /// given log.
+    #[error("the wave's payment logs don't all come right before its RootPaid log")]
+    Payments,
+    /// The logged payments are not a wave the vault takes.
+    #[error("the logged payments are not a wave: {0}")]
+    Refused(WaveError),
+    /// `RootPaid`'s key or total is not the logged wave's.
+    #[error("RootPaid's key or total is not the logged wave's")]
+    NotTheWave,
+    /// After `RootPaid`, the token's next transfers are not one from the
+    /// payer to each of the wave's payees, of the sum of its payments.
+    #[error(
+        "the token transfers after RootPaid are not one from the payer to each payee, \
+         of the sum of its payments"
+    )]
+    Transfers,
+}
+
+/// The wave holding `vault`'s `DataPaymentMade` log at `log_index` in
+/// `receipt`, read back as the vault logs a wave it records:
+///
+/// 1. that log and the vault's `DataPaymentMade` logs after it run on to the
+///    vault's `RootPaid` log, and the leaf count it names of logs right
+///    before it are the wave's payments, that log among them;
+/// 2. those payments are a wave the vault takes ([`Wave::new`]), whose key
+///    and total `RootPaid` names;
+/// 3. after `RootPaid`, the token's next transfers, with nothing between them
+///    but the token's own other logs, are one from `RootPaid`'s payer to each
+///    of the wave's payees, of the sum of its payments ([`Wave::sums`]), in
+///    any order.
+///
+/// Logs are found by their log index, which counts on without a gap through
+/// a transaction's logs. An index two of the receipt's logs share holds
+/// neither. Whether the transaction succeeded is the caller's to check.
+///
+/// # Errors
+///
+/// Returns the first of these checks that fails.
+pub fn recorded_wave(
+    receipt: &PaymentReceipt,
+    vault: &RootVault,
+    log_index: u64,
+) -> Result<RecordedWave, WaveLogError> {
+    let logs = Logs::new(receipt);
+    let vault_log = |at: u64| logs.at(at).filter(|log| log.address == vault.address);
+    if !vault_log(log_index).is_some_and(is_payment_log) {
+        return Err(WaveLogError::Payments);
+    }
+    let mut at = log_index;
+    let root_paid = loop {
+        at = at.checked_add(1).ok_or(WaveLogError::NoRootPaid)?;
+        match vault_log(at) {
+            Some(log) if is_payment_log(log) => {}
+            Some(log) if log.topics.first() == Some(&ROOT_PAID_TOPIC) => break log,
+            _ => return Err(WaveLogError::NoRootPaid),
+        }
+    };
+    let (key, payer, leaf_count, total) =
+        root_paid_fields(root_paid).ok_or(WaveLogError::BadRootPaid)?;
+    let first = at
+        .checked_sub(leaf_count)
+        .filter(|first| *first <= log_index)
+        .ok_or(WaveLogError::Payments)?;
+    let payments = (first..at)
+        .map(|index| {
+            vault_log(index)
+                .filter(|log| is_payment_log(log))
+                .and_then(payment_in)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(WaveLogError::Payments)?;
+    let wave = Wave::new(payments).map_err(WaveLogError::Refused)?;
+    if wave.key(&vault.address) != key || wave.total() != total {
+        return Err(WaveLogError::NotTheWave);
+    }
+    check_transfers(&logs, vault, at, &payer, wave.sums())?;
+    Ok(RecordedWave {
+        wave,
+        key,
+        payer,
+        first_log_index: first,
+    })
+}
+
+/// A receipt's logs by log index. An index two logs share holds neither: one
+/// transaction never logs twice at one place.
+struct Logs<'r>(BTreeMap<u64, Option<&'r PaymentLog>>);
+
+impl<'r> Logs<'r> {
+    fn new(receipt: &'r PaymentReceipt) -> Self {
+        let mut logs = BTreeMap::new();
+        for log in &receipt.logs {
+            logs.entry(log.log_index)
+                .and_modify(|shared| *shared = None)
+                .or_insert(Some(log));
+        }
+        Self(logs)
+    }
+
+    fn at(&self, log_index: u64) -> Option<&'r PaymentLog> {
+        self.0.get(&log_index).copied().flatten()
+    }
+}
+
+/// Whether `log` is shaped as a `DataPaymentMade` log: its signature and
+/// three indexed fields.
+fn is_payment_log(log: &PaymentLog) -> bool {
+    log.topics.len() == 4 && log.topics[0] == DATA_PAYMENT_MADE_TOPIC
+}
+
+/// The address in a 32-byte word, if its first 12 bytes are zero.
+fn address_in(word: &[u8; 32]) -> Option<[u8; 20]> {
+    let (zeros, address) = word.split_at(12);
+    if zeros.iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    address.try_into().ok()
+}
+
+/// The payment a `DataPaymentMade` log records.
+fn payment_in(log: &PaymentLog) -> Option<RootPayment> {
+    let [_, payee, amount, quote_hash] = log.topics.as_slice() else {
+        return None;
+    };
+    Some(RootPayment {
+        quote_hash: *quote_hash,
+        payee: address_in(payee)?,
+        amount: Amount::from_be_bytes(*amount),
+    })
+}
+
+/// A `RootPaid` log's key, payer, leaf count and total, if it is as the vault
+/// writes it.
+fn root_paid_fields(log: &PaymentLog) -> Option<([u8; 32], [u8; 20], u64, Amount)> {
+    let [topic, key] = log.topics.as_slice() else {
+        return None;
+    };
+    if *topic != ROOT_PAID_TOPIC || log.data.len() != 96 {
+        return None;
+    }
+    let word = |at: usize| -> Option<[u8; 32]> { log.data.get(at..at + 32)?.try_into().ok() };
+    let payer = address_in(&word(0)?)?;
+    let leaf_count = u64::try_from(Amount::from_be_bytes(word(32)?))
+        .ok()
+        .filter(|count| (1..=LEAF_LIMIT).contains(count))?;
+    let total = Amount::from_be_bytes(word(64)?);
+    Some((*key, payer, leaf_count, total))
+}
+
+/// A token `Transfer` log's sender, receiver and amount.
+fn transfer_in(log: &PaymentLog) -> Option<([u8; 20], [u8; 20], Amount)> {
+    let [_, from, to] = log.topics.as_slice() else {
+        return None;
+    };
+    let amount: [u8; 32] = log.data.as_slice().try_into().ok()?;
+    Some((
+        address_in(from)?,
+        address_in(to)?,
+        Amount::from_be_bytes(amount),
+    ))
+}
+
+/// The token's transfers after the `RootPaid` log at `root_paid`: one from
+/// `payer` to each payee in `sums`, of its sum, with nothing between them but
+/// the token's own other logs.
+fn check_transfers(
+    logs: &Logs<'_>,
+    vault: &RootVault,
+    root_paid: u64,
+    payer: &[u8; 20],
+    sums: Vec<([u8; 20], Amount)>,
+) -> Result<(), WaveLogError> {
+    let mut owed: HashMap<[u8; 20], Amount> = sums.into_iter().collect();
+    let mut at = root_paid;
+    while !owed.is_empty() {
+        at = at.checked_add(1).ok_or(WaveLogError::Transfers)?;
+        let log = logs
+            .at(at)
+            .filter(|log| log.address == vault.token)
+            .ok_or(WaveLogError::Transfers)?;
+        if log.topics.first() != Some(&TRANSFER_TOPIC) {
+            continue;
+        }
+        let (from, to, amount) = transfer_in(log).ok_or(WaveLogError::Transfers)?;
+        if from != *payer || owed.remove(&to) != Some(amount) {
+            return Err(WaveLogError::Transfers);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
