@@ -60,6 +60,7 @@ pub mod listing;
 pub mod message;
 pub mod payment;
 pub mod proof;
+pub mod root;
 pub mod walk;
 
 #[cfg(test)]
