@@ -7,10 +7,13 @@ use super::*;
 use crate::envelope::Salt;
 use crate::flags::{Flags, PaymentField, ShownFields};
 use crate::proof::{check_proof, EnvelopeProof, ProofError};
-use crate::root::{recorded_wave, RootPayment, Wave, WaveError, WaveLogError, TRANSFER_TOPIC};
+use crate::root::{
+    leaf_key, recorded_wave, RecordedWave, RootPayment, Wave, WaveError, WaveLogError,
+    TRANSFER_TOPIC,
+};
 use crate::test_support::{
-    address_word, data_map, metadata, payment_log, receipt, root_wave_logs, signed_quote,
-    BLOCK_TIME, PAYER, REWARDS, ROOT_VAULT, TOKEN, VAULT, VAULTS,
+    address_word, data_map, metadata, payment_log, receipt, receipt_vector, root_wave_logs,
+    root_wave_logs_at, signed_quote, BLOCK_TIME, PAYER, REWARDS, ROOT_VAULT, TOKEN, VAULT, VAULTS,
 };
 use ant_protocol::evm::Amount;
 
@@ -274,6 +277,92 @@ fn others() -> Vec<RootPayment> {
         high(1, 0x31, 17),
         high(0, 0x33, 19),
     ]
+}
+
+#[test]
+fn the_vaults_own_receipt_reads_whole_from_each_payment() {
+    // A receipt the vault's own code wrote on a local chain: five payments,
+    // the last leaf carried up, two payees paid twice and the payer one of
+    // the payees; the logs from log index 1 on, the payer's approval taking
+    // index 0 in the block.
+    let vector = receipt_vector();
+    let root = vector.vault;
+    let wave = &vector.wave;
+    let count = wave.leaf_count();
+    let first = vector.logs[0].log_index;
+    assert_eq!((count, first), (5, 1));
+    assert_eq!(vector.logs.len(), 5 + 1 + 3);
+    let sums = wave.sums();
+    assert_eq!(sums.len(), 3);
+    assert!(sums.iter().any(|(payee, _)| *payee == vector.payer));
+    assert_eq!(wave.path(4).map(|path| path.len()), Some(1));
+
+    // What the vault gave for the wave is the wave's, and each path the
+    // vault accepted is the payment's own and leads to the key.
+    assert_eq!(wave.root(), vector.root);
+    assert_eq!(wave.key(&root.address), vector.key);
+    assert_eq!(wave.total(), vector.total);
+    assert_eq!(vector.paths.len(), 5);
+    for (at, path) in vector.paths.iter().enumerate() {
+        assert_eq!(wave.path(at).as_ref(), Some(path), "{at}");
+        let payment = &wave.payments()[at];
+        assert_eq!(
+            leaf_key(&root.address, payment, at as u64, count, path),
+            Some(vector.key),
+            "{at}"
+        );
+    }
+
+    // The tests' fixture writes these logs exactly, given this vault and
+    // token: the tests built on it read logs as the vault writes them.
+    assert_eq!(
+        root_wave_logs_at(&root, wave, vector.payer, first),
+        vector.logs
+    );
+
+    // Each payment's log reads the wave back whole, and is the payment a
+    // listing showing its log index finds; a listing showing no log index
+    // finds the wave's first.
+    let written = receipt(TX, BLOCK, vector.logs.clone());
+    let vaults = VaultSet::with_root(VAULT, root);
+    let read = RecordedWave {
+        wave: wave.clone(),
+        key: vector.key,
+        payer: vector.payer,
+        first_log_index: first,
+    };
+    for at in first..first + count {
+        assert_eq!(recorded_wave(&written, &root, at), Ok(read.clone()), "{at}");
+        let found = paying_log(&written, &vaults, |log, vault| {
+            at_index(log, Some(at)) && is_vault_payment(log, vault)
+        });
+        assert_eq!(found.map(|log| log.log_index), Ok(at), "{at}");
+    }
+    let found = paying_log(&written, &vaults, |log, vault| {
+        at_index(log, None) && is_vault_payment(log, vault)
+    });
+    assert_eq!(found.map(|log| log.log_index), Ok(first));
+    // RootPaid's place and the transfers' hold no payment of the wave.
+    for at in first + count..first + count + 4 {
+        assert_eq!(
+            recorded_wave(&written, &root, at),
+            Err(WaveLogError::Payments),
+            "{at}"
+        );
+    }
+
+    // Without any one of its transfers, the payer's to itself among them, the
+    // wave reads as unpaid from each of its payments.
+    for transfer in first + count + 1..first + count + 4 {
+        let short = receipt(TX, BLOCK, without(&vector.logs, transfer));
+        for at in first..first + count {
+            assert_eq!(
+                recorded_wave(&short, &root, at).map(drop),
+                Err(WaveLogError::Transfers),
+                "{transfer}, {at}"
+            );
+        }
+    }
 }
 
 #[test]

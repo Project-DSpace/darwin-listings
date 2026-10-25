@@ -6,6 +6,7 @@
 //! place in a wave, so it is checked as `u64::MAX`, which is too.
 
 use super::*;
+use crate::test_support::{bytes, list, number, payments, read_json, small};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -15,73 +16,9 @@ fn vectors() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/root/vectors")
 }
 
-fn read_json(path: PathBuf) -> Value {
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path:?}: {e}"))
-}
-
 /// A vector file, by name.
 fn read(name: &str) -> Value {
     read_json(vectors().join(name))
-}
-
-/// A hash or address: a 0x-prefixed hex string of exactly `N` bytes.
-fn bytes<const N: usize>(value: &Value) -> [u8; N] {
-    let text = value
-        .as_str()
-        .unwrap_or_else(|| panic!("not a string: {value}"));
-    let digits = text.strip_prefix("0x").expect("0x-prefixed");
-    crate::proof::decode_hex(digits)
-        .expect("hex")
-        .try_into()
-        .unwrap_or_else(|_| panic!("not {N} bytes: {text}"))
-}
-
-/// A list of hashes or addresses.
-fn list<const N: usize>(value: &Value) -> Vec<[u8; N]> {
-    value
-        .as_array()
-        .expect("a list")
-        .iter()
-        .map(bytes)
-        .collect()
-}
-
-/// An integer: a 0x-prefixed hex string, never a JSON number.
-fn number(value: &Value) -> Amount {
-    let text = value
-        .as_str()
-        .unwrap_or_else(|| panic!("not a string: {value}"));
-    Amount::from_str_radix(text.strip_prefix("0x").expect("0x-prefixed"), 16).expect("hex")
-}
-
-/// An integer as a `u64`, or `u64::MAX` if it doesn't fit.
-fn small(value: &Value) -> u64 {
-    u64::try_from(number(value)).unwrap_or(u64::MAX)
-}
-
-/// A wave file's payments.
-fn payments(wave: &Value) -> Vec<RootPayment> {
-    let quote_hashes = list::<32>(&wave["quoteHashes"]);
-    let payees = list::<20>(&wave["payees"]);
-    let amounts: Vec<Amount> = wave["amounts"]
-        .as_array()
-        .expect("a list")
-        .iter()
-        .map(number)
-        .collect();
-    assert_eq!(quote_hashes.len(), payees.len());
-    assert_eq!(quote_hashes.len(), amounts.len());
-    quote_hashes
-        .into_iter()
-        .zip(payees)
-        .zip(amounts)
-        .map(|((quote_hash, payee), amount)| RootPayment {
-            quote_hash,
-            payee,
-            amount,
-        })
-        .collect()
 }
 
 /// The wave files index.json lists, which are every wave file in the folder.
@@ -253,6 +190,16 @@ fn refused_places_leaf_counts_and_paths() {
         }
     }
     assert_eq!(seen, ["key", "root", "shape"].map(String::from).into());
+}
+
+#[test]
+fn the_topics_are_their_events_signatures() {
+    let topic = |signature: &str| -> [u8; 32] { Keccak256::digest(signature.as_bytes()).into() };
+    assert_eq!(
+        topic("RootPaid(bytes32,address,uint256,uint256)"),
+        ROOT_PAID_TOPIC
+    );
+    assert_eq!(topic("Transfer(address,address,uint256)"), TRANSFER_TOPIC);
 }
 
 #[test]

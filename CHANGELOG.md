@@ -41,7 +41,8 @@ every reader of payments to this version, indexers included, before then.
   the storer's check of a payment's path; `recorded_wave`, which reads a wave
   back from a receipt; `ROOT_PAID_TOPIC`, `TRANSFER_TOPIC`, `LEAF_LIMIT` (512)
   and `MAX_PATH_LEN` (9). It is checked against the vault's own test vectors,
-  in `src/root/vectors/`.
+  in `src/root/vectors/`, and `recorded_wave` against a receipt the vault's
+  code wrote.
 
 ### Unchanged
 

@@ -299,6 +299,9 @@ A wave the vault records logs, in this order: each payment's
 leafCount, uint256 total)`; then one token `Transfer` from the payer to each
 distinct payee, of the sum of its payments, in the order the payees first
 appear. A wave sent again moves nothing and logs nothing.
+`src/root/vectors/receipt.json` holds the logs of one such wave, as the
+vault's code wrote them on a local chain, and the reader is checked against
+them.
 
 A root vault's `DataPaymentMade` log counts as a payment only where the
 receipt shows its wave whole (`root::recorded_wave`):
