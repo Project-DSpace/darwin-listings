@@ -274,6 +274,27 @@ fn production_keys_name_the_production_vault() {
 }
 
 #[test]
+fn vector_files_name_nothing_outside_the_crate() {
+    // The files describe the tree and their own fields, and name no file or
+    // folder but their own: a copy that brings in text written for another
+    // place fails here.
+    let mut files =
+        vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/root/production-vectors.json")];
+    files.extend(
+        std::fs::read_dir(vectors())
+            .unwrap()
+            .map(|entry| entry.unwrap().path()),
+    );
+    assert!(files.len() > 20);
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        for outside in ["script/", "root-vectors/", "public repos"] {
+            assert!(!text.contains(outside), "{path:?} names {outside}");
+        }
+    }
+}
+
+#[test]
 fn paths_hold_at_most_max_path_len_hashes() {
     // A path holds one hash for each level above the leaves.
     assert_eq!(1u64 << MAX_PATH_LEN, LEAF_LIMIT);

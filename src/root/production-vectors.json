@@ -1,5 +1,5 @@
 {
- "about": "DarwinRootVault's keys under the production vault's address (`productionVault`), the CREATE2 address of the pinned build, written by script/make_root_vectors.py. Each entry names a wave in root-vectors/ and gives its root, leaf count and key = keccak256(0x02 || productionVault || root || leafCount). The leaf counts are 0x-prefixed hex strings, as in root-vectors/. A reader's built-in root-vault address must equal `productionVault`, and its key function must give these keys. This file stays out of public repos until the production address may be published.",
+ "about": "DarwinRootVault's keys under the production vault's address (`productionVault`): the root vault's fixed address, the CREATE2 address of the pinned build. Each entry names a wave in vectors/ and gives its root, leaf count and key = keccak256(0x02 || productionVault || root || leafCount). The leaf counts are 0x-prefixed hex strings, as in vectors/. A reader's built-in root-vault address must equal `productionVault`, and its key function must give these keys.",
  "productionVault": "0xf6675722f443132b045857546e57e35360bb03b9",
  "keyVectors": [
   {
