@@ -424,45 +424,173 @@ pub fn recorded_wave(
     vault: &RootVault,
     log_index: u64,
 ) -> Result<RecordedWave, WaveLogError> {
-    let logs = Logs::new(receipt);
-    let vault_log = |at: u64| logs.at(at).filter(|log| log.address == vault.address);
-    if !vault_log(log_index).is_some_and(is_payment_log) {
-        return Err(WaveLogError::Payments);
-    }
-    let mut at = log_index;
-    let root_paid = loop {
-        at = at.checked_add(1).ok_or(WaveLogError::NoRootPaid)?;
-        match vault_log(at) {
-            Some(log) if is_payment_log(log) => {}
-            Some(log) if log.topics.first() == Some(&ROOT_PAID_TOPIC) => break log,
-            _ => return Err(WaveLogError::NoRootPaid),
-        }
-    };
-    let (key, payer, leaf_count, total) =
-        root_paid_fields(root_paid).ok_or(WaveLogError::BadRootPaid)?;
-    let first = at
-        .checked_sub(leaf_count)
-        .filter(|first| *first <= log_index)
-        .ok_or(WaveLogError::Payments)?;
-    let payments = (first..at)
-        .map(|index| {
-            vault_log(index)
-                .filter(|log| is_payment_log(log))
-                .and_then(payment_in)
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or(WaveLogError::Payments)?;
-    let wave = Wave::new(payments).map_err(WaveLogError::Refused)?;
-    if wave.key(&vault.address) != key || wave.total() != total {
-        return Err(WaveLogError::NotTheWave);
-    }
-    check_transfers(&logs, vault, at, &payer, wave.sums())?;
+    let mut waves = RecordedWaves::new(receipt, *vault);
+    let place = waves.place(log_index)?;
+    let wave = waves.whole(&place)?;
     Ok(RecordedWave {
         wave,
-        key,
-        payer,
-        first_log_index: first,
+        key: place.key,
+        payer: place.payer,
+        first_log_index: place.first,
     })
+}
+
+/// A receipt's waves at one root vault, read as [`recorded_wave`] reads
+/// one, for any number of the vault's logs ([`RecordedWaves::check`]): each
+/// wave is checked as a whole once, however many of its payments' logs are
+/// asked about, so checking each of a wave's logs costs about as much as
+/// checking one.
+pub(crate) struct RecordedWaves<'r> {
+    logs: Logs<'r>,
+    vault: RootVault,
+    /// The last walk from a payment's log on to a `RootPaid` log: the log it
+    /// started from, and the `RootPaid` log's index.
+    walked: Option<(u64, u64)>,
+    /// Whether each wave checked as a whole so far checks out, by its
+    /// `RootPaid` log's index.
+    checked: BTreeMap<u64, Result<(), WaveLogError>>,
+}
+
+/// Where the wave holding a payment's log sits in a receipt, and what its
+/// `RootPaid` log names.
+struct WavePlace {
+    /// The `RootPaid` log's index.
+    root_paid: u64,
+    /// The index of the wave's first `DataPaymentMade` log.
+    first: u64,
+    /// The key `RootPaid` names.
+    key: [u8; 32],
+    /// The payer `RootPaid` names.
+    payer: [u8; 20],
+    /// The total `RootPaid` names.
+    total: Amount,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many waves this thread has checked as a whole: the tests count
+    /// the work a receipt costs with it.
+    pub(crate) static WHOLE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl<'r> RecordedWaves<'r> {
+    pub(crate) fn new(receipt: &'r PaymentReceipt, vault: RootVault) -> Self {
+        Self {
+            logs: Logs::new(receipt),
+            vault,
+            walked: None,
+            checked: BTreeMap::new(),
+        }
+    }
+
+    /// Whether the receipt shows whole the wave holding the vault's
+    /// `DataPaymentMade` log at `log_index`: [`recorded_wave`]'s checks, the
+    /// same answer. The checks that depend on the log alone run for each
+    /// log, and those of the wave as a whole (its payments, its key and
+    /// total, its transfers) once for all its logs, so a wave that fails
+    /// them fails for each of its logs from that one check.
+    ///
+    /// # Errors
+    ///
+    /// The first of [`recorded_wave`]'s checks that fails.
+    pub(crate) fn check(&mut self, log_index: u64) -> Result<(), WaveLogError> {
+        let place = self.place(log_index)?;
+        if let Some(checked) = self.checked.get(&place.root_paid) {
+            return *checked;
+        }
+        let checked = self.whole(&place).map(drop);
+        self.checked.insert(place.root_paid, checked);
+        checked
+    }
+
+    /// The vault's log at `log_index`, if the receipt holds it alone there.
+    fn vault_log(&self, log_index: u64) -> Option<&'r PaymentLog> {
+        self.logs
+            .at(log_index)
+            .filter(|log| log.address == self.vault.address)
+    }
+
+    /// [`recorded_wave`]'s first check for the vault's log at `log_index`:
+    /// the logs from it on run on to the vault's `RootPaid` log, which is as
+    /// the vault writes it and counts back to a first payment no later than
+    /// this one. No hashing, and a run of payment logs is walked once
+    /// however many of its logs are asked about in order.
+    fn place(&mut self, log_index: u64) -> Result<WavePlace, WaveLogError> {
+        let root_paid = match self.walked {
+            // The last walk passed this log, and found each log it passed to
+            // be one of the vault's payment logs: this one's walk would end
+            // at the same RootPaid log.
+            Some((from, root_paid)) if from < log_index && log_index < root_paid => root_paid,
+            _ => {
+                let root_paid = self.walk(log_index)?;
+                self.walked = Some((log_index, root_paid));
+                root_paid
+            }
+        };
+        let (key, payer, leaf_count, total) = self
+            .vault_log(root_paid)
+            .and_then(root_paid_fields)
+            .ok_or(WaveLogError::BadRootPaid)?;
+        let first = root_paid
+            .checked_sub(leaf_count)
+            .filter(|first| *first <= log_index)
+            .ok_or(WaveLogError::Payments)?;
+        Ok(WavePlace {
+            root_paid,
+            first,
+            key,
+            payer,
+            total,
+        })
+    }
+
+    /// The index of the vault's `RootPaid` log that the vault's
+    /// `DataPaymentMade` logs from the one at `log_index` on run on to.
+    fn walk(&self, log_index: u64) -> Result<u64, WaveLogError> {
+        if !self.vault_log(log_index).is_some_and(is_payment_log) {
+            return Err(WaveLogError::Payments);
+        }
+        let mut at = log_index;
+        loop {
+            at = at.checked_add(1).ok_or(WaveLogError::NoRootPaid)?;
+            match self.vault_log(at) {
+                Some(log) if is_payment_log(log) => {}
+                Some(log) if log.topics.first() == Some(&ROOT_PAID_TOPIC) => return Ok(at),
+                _ => return Err(WaveLogError::NoRootPaid),
+            }
+        }
+    }
+
+    /// The rest of [`recorded_wave`]'s checks, of the wave at `place` as a
+    /// whole: the leaf count's logs before `RootPaid` are all the vault's
+    /// payment logs, their payments are a wave the vault takes, whose key
+    /// and total `RootPaid` names, and the token's transfers after `RootPaid`
+    /// pay each payee its sum. They depend on the `RootPaid` log alone, not
+    /// on which of the wave's logs is asked about.
+    fn whole(&self, place: &WavePlace) -> Result<Wave, WaveLogError> {
+        #[cfg(test)]
+        WHOLE_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        let payments = (place.first..place.root_paid)
+            .map(|index| {
+                self.vault_log(index)
+                    .filter(|log| is_payment_log(log))
+                    .and_then(payment_in)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(WaveLogError::Payments)?;
+        let wave = Wave::new(payments).map_err(WaveLogError::Refused)?;
+        if wave.key(&self.vault.address) != place.key || wave.total() != place.total {
+            return Err(WaveLogError::NotTheWave);
+        }
+        check_transfers(
+            &self.logs,
+            &self.vault,
+            place.root_paid,
+            &place.payer,
+            wave.sums(),
+        )?;
+        Ok(wave)
+    }
 }
 
 /// A receipt's logs by log index. An index two logs share holds neither: one

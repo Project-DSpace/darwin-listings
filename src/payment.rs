@@ -12,10 +12,11 @@
 //! payments under one key ([`root`](crate::root)). Both log each paid quote
 //! as the same `DataPaymentMade` event, so a payment is found the same way in
 //! either, each by its own address. A root vault's log counts only if the
-//! receipt shows its wave whole, transfers included ([`recorded_wave`]);
-//! otherwise it reads as unpaid ([`PaymentError::UnpaidWave`]). A log of that
-//! shape from any other contract is never a payment
-//! ([`PaymentError::UnknownVault`]): any contract can emit one.
+//! receipt shows its wave whole, transfers included
+//! ([`recorded_wave`](crate::root::recorded_wave)); otherwise it reads as
+//! unpaid ([`PaymentError::UnpaidWave`]). A log of that shape from any other
+//! contract is never a payment ([`PaymentError::UnknownVault`]): any
+//! contract can emit one.
 //!
 //! A paid quote proves that its address was paid for by the block it was
 //! paid in, not that this was the upload's payment. Nothing on chain ties a
@@ -36,7 +37,7 @@
 
 use crate::envelope::Envelope;
 use crate::listing::{Listing, ListingError, MergedListing, Payment, CLOCK_MARGIN};
-use crate::root::{recorded_wave, WaveLogError};
+use crate::root::{RecordedWaves, WaveLogError};
 use ant_protocol::evm::PaymentQuote;
 use ant_protocol::{verify_quote_content, verify_quote_signature, XorName};
 use serde::{Deserialize, Serialize};
@@ -207,7 +208,7 @@ pub enum PaymentError {
     /// The root vault's log would be the payment, but the receipt doesn't show
     /// its wave whole: its payments, its `RootPaid` log and its token
     /// transfers, one to each payee of the sum of its payments
-    /// ([`recorded_wave`]). It reads as unpaid.
+    /// ([`recorded_wave`](crate::root::recorded_wave)). It reads as unpaid.
     #[error("the root vault's payment log is not backed by its wave: {0}")]
     UnpaidWave(WaveLogError),
 }
@@ -593,8 +594,8 @@ pub fn check_offline(
 ///   a shown timestamp or log index is not checked: [`CheckLevel::Reported`].
 ///
 /// A root vault's log is a payment only if the receipt shows its wave whole,
-/// transfers included ([`recorded_wave`]), and a log from a contract outside
-/// `vaults` never is.
+/// transfers included ([`recorded_wave`](crate::root::recorded_wave)), and a
+/// log from a contract outside `vaults` never is.
 ///
 /// Wherever the payment's block is known and the listing has `first_seen`,
 /// the block's timestamp is needed and must be no later than
@@ -846,7 +847,10 @@ pub(crate) fn pays(log: &PaymentLog, vault: &[u8; 20], quote: &PaymentQuote) -> 
 
 /// The receipt's earliest log that is a payment from a vault in `vaults`:
 /// one that `is_payment(log, vault)` accepts for the per-quote vault, or for
-/// the root vault in a wave the receipt shows whole ([`recorded_wave`]).
+/// the root vault in a wave the receipt shows whole
+/// ([`recorded_wave`](crate::root::recorded_wave)). Each of the root vault's
+/// waves is checked as a whole once, however many of its logs `is_payment`
+/// accepts.
 ///
 /// # Errors
 ///
@@ -862,13 +866,16 @@ pub(crate) fn paying_log<'r>(
     let mut logs: Vec<&PaymentLog> = receipt.logs.iter().collect();
     logs.sort_by_key(|log| log.log_index);
     let mut unpaid = PaymentError::NotPaid;
+    // The root vault's waves, read once one of its logs would be the payment.
+    let mut waves = None;
     for log in logs {
         if is_payment(log, &vaults.v2) {
             return Ok(log);
         }
         if let Some(root) = vaults.root.filter(|root| is_payment(log, &root.address)) {
-            match recorded_wave(receipt, &root, log.log_index) {
-                Ok(_) => return Ok(log),
+            let waves = waves.get_or_insert_with(|| RecordedWaves::new(receipt, root));
+            match waves.check(log.log_index) {
+                Ok(()) => return Ok(log),
                 Err(error) if unpaid.weight() < 2 => unpaid = PaymentError::UnpaidWave(error),
                 Err(_) => {}
             }

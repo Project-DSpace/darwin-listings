@@ -2,11 +2,13 @@
 //!
 //! Every check that reads a payment takes the vault set and goes through
 //! `paying_log`, which tells the per-quote vault, the root vault and contracts
-//! outside the set apart: only `paying_log` reads a root vault's wave, and
-//! only it refuses a log as `UnknownVault` or `UnpaidWave`. `pays` and
-//! `is_vault_payment` each take one address, and are called only in the
-//! checks `paying_log` runs. A new read, or a read moved, fails here until it
-//! is listed and reviewed.
+//! outside the set apart: only `paying_log` reads a root vault's waves in a
+//! check, through `RecordedWaves`, and only it refuses a log as `UnknownVault`
+//! or `UnpaidWave`. `recorded_wave`, the same read for one log, is for callers
+//! of the crate, and no check here calls it. `pays` and `is_vault_payment`
+//! each take one address, and are called only in the checks `paying_log`
+//! runs. A new read, or a read moved, fails here until it is listed and
+//! reviewed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ const COUNTED: &[&str] = &[
     "is_vault_payment(",
     "paying_log(",
     "recorded_wave(",
+    "RecordedWaves::new(",
     "PaymentError::UnknownVault",
     "PaymentError::UnpaidWave(",
 ];
@@ -33,9 +36,9 @@ const REVIEWED: &[(&str, &str, &str, usize)] = &[
     ("src/payment.rs", "verify_listing", "is_vault_payment(", 1),
     // One address's payment for a quote.
     ("src/payment.rs", "pays", "is_vault_payment(", 1),
-    // The one place a payment log is found, a root vault's wave read and a
+    // The one place a payment log is found, a root vault's waves read and a
     // log from outside the set refused.
-    ("src/payment.rs", "paying_log", "recorded_wave(", 1),
+    ("src/payment.rs", "paying_log", "RecordedWaves::new(", 1),
     (
         "src/payment.rs",
         "paying_log",
@@ -51,6 +54,8 @@ const REVIEWED: &[(&str, &str, &str, usize)] = &[
     // An upload proof.
     ("src/proof.rs", "check_proof", "paying_log(", 1),
     ("src/proof.rs", "check_proof", "pays(", 1),
+    // The read of one log's wave, for callers of the crate: the same reader.
+    ("src/root.rs", "recorded_wave", "RecordedWaves::new(", 1),
 ];
 
 /// The crate's source files, its tests left out.

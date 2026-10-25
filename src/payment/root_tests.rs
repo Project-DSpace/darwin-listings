@@ -8,14 +8,15 @@ use crate::envelope::Salt;
 use crate::flags::{Flags, PaymentField, ShownFields};
 use crate::proof::{check_proof, EnvelopeProof, ProofError};
 use crate::root::{
-    leaf_key, recorded_wave, RecordedWave, RootPayment, Wave, WaveError, WaveLogError,
-    TRANSFER_TOPIC,
+    leaf_key, recorded_wave, RecordedWave, RecordedWaves, RootPayment, Wave, WaveError,
+    WaveLogError, TRANSFER_TOPIC, WHOLE_CHECKS,
 };
 use crate::test_support::{
     address_word, data_map, metadata, payment_log, receipt, receipt_vector, root_wave_logs,
     root_wave_logs_at, signed_quote, BLOCK_TIME, PAYER, REWARDS, ROOT_VAULT, TOKEN, VAULT, VAULTS,
 };
 use ant_protocol::evm::Amount;
+use std::cell::Cell;
 
 const TX: [u8; 32] = [0x77; 32];
 const BLOCK: u64 = 1_000;
@@ -134,6 +135,18 @@ impl Paid {
         Listing::new(&self.envelope, &self.find(receipt).unwrap(), NOW)
     }
 
+    /// The envelope's payment as the wave's logs place it, in `TX` in block
+    /// `BLOCK`, whether or not a receipt shows it.
+    fn payment(&self) -> Payment {
+        Payment {
+            tx_hash: TX,
+            block_number: BLOCK,
+            block_timestamp: block_time(BLOCK),
+            log_index: self.log_index(),
+            quote: encode_quote(&self.quote).unwrap(),
+        }
+    }
+
     /// The uploader's proof, paid in `TX`.
     fn proof(&self) -> EnvelopeProof {
         EnvelopeProof::new(&self.envelope, TX, &self.quote).unwrap()
@@ -146,13 +159,7 @@ impl Paid {
     fn checks(&self, receipt: &PaymentReceipt) -> Result<u64, PaymentError> {
         let found = self.find(receipt).map(|payment| payment.log_index);
         let at = self.log_index();
-        let honest = Payment {
-            tx_hash: TX,
-            block_number: BLOCK,
-            block_timestamp: block_time(BLOCK),
-            log_index: at,
-            quote: encode_quote(&self.quote).unwrap(),
-        };
+        let honest = self.payment();
         let time = Some(block_time(BLOCK));
         let full = Listing::new(&self.envelope, &honest, NOW);
         let listed = verify_listing(&full, &self.envelope, Some(receipt), time, &VAULTS, NOW)
@@ -250,6 +257,40 @@ fn check(
     verify_listing_receipts(listing, envelope, &fetched, &VAULTS, NOW)
 }
 
+/// Each place in `receipt`, read for the tests' root vault with one
+/// [`RecordedWaves`] in log order, as `paying_log` reads them, and again in
+/// the reverse order, gives what [`recorded_wave`] gives it alone: a wave
+/// checked once for all its logs is checked as it is for each.
+fn read_together_as_alone(receipt: &PaymentReceipt) {
+    let root = VAULTS.root.unwrap();
+    read_together_as_alone_at(receipt, &root);
+}
+
+/// [`read_together_as_alone`] for `vault`.
+fn read_together_as_alone_at(receipt: &PaymentReceipt, vault: &RootVault) {
+    let mut places: Vec<u64> = receipt.logs.iter().map(|log| log.log_index).collect();
+    places.sort_unstable();
+    places.dedup();
+    let reversed: Vec<u64> = places.iter().rev().copied().collect();
+    for order in [places, reversed] {
+        let mut waves = RecordedWaves::new(receipt, *vault);
+        for at in order {
+            assert_eq!(
+                waves.check(at),
+                recorded_wave(receipt, vault, at).map(drop),
+                "{at}"
+            );
+        }
+    }
+}
+
+/// What `run` gives, and how many waves it checked as a whole.
+fn whole_checks<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let before = WHOLE_CHECKS.with(Cell::get);
+    let result = run();
+    (result, WHOLE_CHECKS.with(Cell::get) - before)
+}
+
 /// A payment of a content chunk, as [`other`], whose quote hash is `n`
 /// itself: below any quote's hash but a few.
 fn low(n: u8, payee: u8, amount: u64) -> RootPayment {
@@ -324,6 +365,7 @@ fn the_vaults_own_receipt_reads_whole_from_each_payment() {
     // listing showing its log index finds; a listing showing no log index
     // finds the wave's first.
     let written = receipt(TX, BLOCK, vector.logs.clone());
+    read_together_as_alone_at(&written, &root);
     let vaults = VaultSet::with_root(VAULT, root);
     let read = RecordedWave {
         wave: wave.clone(),
@@ -355,6 +397,7 @@ fn the_vaults_own_receipt_reads_whole_from_each_payment() {
     // wave reads as unpaid from each of its payments.
     for transfer in first + count + 1..first + count + 4 {
         let short = receipt(TX, BLOCK, without(&vector.logs, transfer));
+        read_together_as_alone_at(&short, &root);
         for at in first..first + count {
             assert_eq!(
                 recorded_wave(&short, &root, at).map(drop),
@@ -580,6 +623,7 @@ fn a_wave_whose_transfers_dont_show_reads_as_unpaid() {
     for (case, logs) in refused {
         let receipt = receipt(TX, BLOCK, logs);
         assert_eq!(paid.checks(&receipt), unpaid, "{case}");
+        read_together_as_alone(&receipt);
     }
 
     // The transfers in another order, the token's own other logs between
@@ -601,6 +645,7 @@ fn a_wave_whose_transfers_dont_show_reads_as_unpaid() {
     for (case, logs) in accepted {
         let receipt = receipt(TX, BLOCK, logs);
         assert_eq!(paid.checks(&receipt), Ok(paid.log_index()), "{case}");
+        read_together_as_alone(&receipt);
     }
 }
 
@@ -723,6 +768,7 @@ fn a_wave_is_read_whole_or_not_at_all() {
     for (case, logs, error) in cases {
         let receipt = receipt(TX, BLOCK, logs);
         assert_eq!(paid.checks(&receipt), unpaid(error), "{case}");
+        read_together_as_alone(&receipt);
     }
 }
 
@@ -780,6 +826,7 @@ fn two_waves_or_two_vaults_in_one_receipt() {
     let both = receipt(TX, BLOCK, logs.clone());
     assert_eq!(first.checks(&both), Ok(first.log_index()));
     assert_eq!(second.checks(&both), Ok(second.log_index()));
+    read_together_as_alone(&both);
 
     // Without the first wave's transfer to the shared payee, the second's
     // doesn't stand in for it.
@@ -796,6 +843,7 @@ fn two_waves_or_two_vaults_in_one_receipt() {
     );
     let second_moved = second.moved(6);
     assert_eq!(second_moved.checks(&broken), Ok(second_moved.log_index()));
+    read_together_as_alone(&broken);
 
     // A per-quote payment and a wave in one transaction, either first, the
     // per-quote vault's transfer logged before its payment.
@@ -813,6 +861,7 @@ fn two_waves_or_two_vaults_in_one_receipt() {
         let logs: Vec<PaymentLog> = wave.logs.iter().chain(&v2_logs).cloned().collect();
         let mixed = receipt(TX, BLOCK, logs);
         assert_eq!(wave.checks(&mixed), Ok(wave.log_index()), "{v2_first}");
+        read_together_as_alone(&mixed);
         let v2_found = find_payment(
             &v2_paid.envelope.address(),
             std::slice::from_ref(&v2_paid.quote),
@@ -908,9 +957,10 @@ fn the_payer_can_be_its_own_payee() {
     assert_eq!(paid.checks(&paid.receipt()), Ok(paid.log_index()));
 }
 
-#[test]
-fn a_full_wave_to_every_payee_reads_whole() {
-    let others: Vec<RootPayment> = (0..511u16)
+/// 511 payments of content chunks, each to a payee of its own: with the
+/// envelope's, a full wave.
+fn to_every_payee() -> Vec<RootPayment> {
+    (0..511u16)
         .map(|n| {
             let mut quote_hash = [0; 32];
             quote_hash[..2].copy_from_slice(&(n + 1).to_be_bytes());
@@ -922,8 +972,12 @@ fn a_full_wave_to_every_payee_reads_whole() {
                 amount: Amount::from(u64::from(n) + 1),
             }
         })
-        .collect();
-    let paid = Paid::shown(&others, 0);
+        .collect()
+}
+
+#[test]
+fn a_full_wave_to_every_payee_reads_whole() {
+    let paid = Paid::shown(&to_every_payee(), 0);
     assert_eq!(paid.wave.leaf_count(), 512);
     assert_eq!(paid.wave.sums().len(), 512);
     assert_eq!(paid.checks(&paid.receipt()), Ok(paid.log_index()));
@@ -931,6 +985,51 @@ fn a_full_wave_to_every_payee_reads_whole() {
     assert_eq!(
         paid.checks(&receipt(TX, BLOCK, without(&paid.logs, last))),
         Err(PaymentError::UnpaidWave(WaveLogError::Transfers))
+    );
+}
+
+#[test]
+fn a_wave_is_checked_once_for_all_its_logs() {
+    // A listing showing only the tx hash takes any vault payment in the tx,
+    // so each of a wave's logs would be the payment. A full wave whose
+    // transfers don't show is refused from one check of the wave as a whole,
+    // not one for each of its 512 logs.
+    let flags = Flags {
+        shown: ShownFields::NONE.with(PaymentField::TxHash),
+        in_index: false,
+        withheld: false,
+    };
+    let paid = Paid::new(flags, &to_every_payee(), 0);
+    assert_eq!(paid.wave.leaf_count(), 512);
+    let listing = Listing::new(&paid.envelope, &paid.payment(), NOW);
+    assert_eq!(
+        payment_lookup(&listing),
+        Ok(Lookup::Transaction { tx_hash: TX })
+    );
+    let mut unbacked = paid.logs.clone();
+    unbacked.retain(|log| log.topics[0] != TRANSFER_TOPIC);
+    assert_eq!(unbacked.len(), 512 + 1);
+    let receipts = [receipt(TX, BLOCK, unbacked.clone())];
+    assert_eq!(
+        whole_checks(|| check(&receipts, &listing, &paid.envelope)),
+        (Err(PaymentError::UnpaidWave(WaveLogError::Transfers)), 1)
+    );
+
+    // Whole, it checks out from its first log, with one check too.
+    let receipts = [paid.receipt()];
+    assert_eq!(
+        whole_checks(|| check(&receipts, &listing, &paid.envelope).map(|check| check.level)),
+        (Ok(CheckLevel::Reported), 1)
+    );
+
+    // Beside a second wave that checks out, each wave is checked once: the
+    // first is refused once for all its logs, and the second counts.
+    let second = Paid::shown(&others(), 513);
+    let both: Vec<PaymentLog> = unbacked.iter().chain(&second.logs).cloned().collect();
+    let receipts = [receipt(TX, BLOCK, both)];
+    assert_eq!(
+        whole_checks(|| check(&receipts, &listing, &paid.envelope).map(|check| check.level)),
+        (Ok(CheckLevel::Reported), 2)
     );
 }
 
